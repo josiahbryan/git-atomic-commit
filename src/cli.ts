@@ -102,6 +102,10 @@ function gitPassthrough(...args: string[]): void {
 	}
 }
 
+function gitCaptureAndReplay(...args: string[]): void {
+	gitPassthrough(...args);
+}
+
 // ── Git Utilities ────────────────────────────────────────────
 
 let _gitDir: string | undefined;
@@ -149,7 +153,7 @@ function pathsSafeForPlainGitAdd({ paths }: { paths: string[] }): string[] {
 
 function stageFiles(files: string[]): void {
 	if (files.length === 0) return;
-	execFileSync('git', ['add', '--', ...files], { stdio: 'pipe', env: GIT_ENV });
+	gitCaptureAndReplay('add', '--', ...files);
 }
 
 /**
@@ -313,6 +317,7 @@ program
 		// Everything after lock acquisition is wrapped in try/finally
 		// so the lock is always released (if we acquired it) on any failure.
 		let commitFailed = false;
+		let failingPhase: 'staging' | 'commit' = 'staging';
 		try {
 			const priorStaged = getStagedFiles();
 			if (priorStaged.length > 0) {
@@ -332,11 +337,13 @@ program
 					);
 				}
 				log(`Staging ${toStage.length} file(s): ${toStage.join(', ') || '(none — using existing index)'}`);
+				failingPhase = 'staging';
 				stageFiles(toStage);
 
 				const commitArgs = ['commit', '-m', message];
 				if (verify === false) commitArgs.push('--no-verify');
 
+				failingPhase = 'commit';
 				log('Committing...');
 				gitPassthrough(...commitArgs);
 				log('Commit successful.');
@@ -346,9 +353,10 @@ program
 					(err?.stderr && String(err.stderr).trim()),
 				);
 				if (!hasGitOutput && err?.message) {
-					logError(`git commit failed: ${err.message}`);
+					const failedCommand = failingPhase === 'staging' ? 'git add' : 'git commit';
+					logError(`${failedCommand} failed: ${err.message}`);
 				}
-				logError('Commit failed — rolling back staging...');
+				logError(`Atomic operation failed during ${failingPhase} — rolling back staging...`);
 
 				const toUnstage = files.filter(
 					(f: string) => !priorStaged.includes(f),

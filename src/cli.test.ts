@@ -161,11 +161,22 @@ describe('git-atomic-commit', () => {
 			// Empty message causes commit to fail
 			const result = gac('commit -f a.txt -m "" --no-verify');
 			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('Atomic operation failed during commit');
 			expect(result.stdout + result.stderr).toContain('rolling back');
 
 			// File should NOT be staged
 			expect(stagedFiles()).toEqual([]);
 			// Lock should be released
+			expect(lockExists()).toBe(false);
+		});
+
+		test('surfaces git add pathspec errors before rollback', () => {
+			const result = gac('commit -f missing.txt -m "test: missing path surfaces error" --no-verify');
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain("pathspec 'missing.txt' did not match any files");
+			expect(result.stdout + result.stderr).toContain('Atomic operation failed during staging');
+			expect(result.stdout + result.stderr).toContain('rolling back');
+			expect(result.stdout + result.stderr).not.toContain('Commit successful');
 			expect(lockExists()).toBe(false);
 		});
 
@@ -262,6 +273,7 @@ describe('git-atomic-commit', () => {
 			expect(result.exitCode).not.toBe(0);
 			expect(result.stdout + result.stderr).toContain('hook stdout: explain the failure');
 			expect(result.stdout + result.stderr).toContain('hook stderr: fix this specific problem');
+			expect(result.stdout + result.stderr).toContain('Atomic operation failed during commit');
 			expect(result.stdout + result.stderr).toContain('rolling back');
 			expect(stagedFiles()).toEqual([]);
 			expect(lockExists()).toBe(false);
