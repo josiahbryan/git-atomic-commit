@@ -1,0 +1,29 @@
+{
+  "name": "git-atomic-commit",
+  "version": "1.0.0",
+  "description": "Atomic git stage+commit with repo-wide locking for multi-agent safety",
+  "license": "MIT",
+  "author": "Josiah Bryan <josiahbryan@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/josiahbryan/git-atomic-commit.git"
+  },
+  "keywords": [
+    "git",
+    "atomic",
+    "commit",
+    "lock",
+    "multi-agent",
+    "concurrency",
+    "monorepo",
+    "ai-agent",
+    "cli"
+  ],
+  "scripts": {
+    "setup": "bun src/install.ts",
+    "uninstall": "bun src/install.ts --uninstall"
+  },
+  "dependencies": {
+    "commander": "^12.0.0"
+  }
+}
