@@ -1,7 +1,8 @@
 #!/usr/bin/env bun
+/* eslint-env node */
 
 import { Command } from 'commander';
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import {
 	mkdirSync,
 	writeFileSync,
@@ -74,7 +75,31 @@ function git(...args: string[]): string {
 }
 
 function gitPassthrough(...args: string[]): void {
-	execFileSync('git', args, { stdio: 'inherit', env: GIT_ENV });
+	const result = spawnSync('git', args, {
+		encoding: 'utf-8',
+		stdio: 'pipe',
+		env: GIT_ENV,
+	});
+
+	// Replay captured git output through this process so outer wrappers
+	// can see the exact hook/git failure details instead of only our summary.
+	if (result.stdout) process.stdout.write(result.stdout);
+	if (result.stderr) process.stderr.write(result.stderr);
+
+	if (result.error) throw result.error;
+	if (result.status !== 0) {
+		const exitDetails = result.signal
+			? `signal ${result.signal}`
+			: `exit code ${result.status ?? 'unknown'}`;
+		const error = new Error(`git ${args[0] ?? 'command'} failed with ${exitDetails}`);
+		Object.assign(error, {
+			stdout: result.stdout,
+			stderr: result.stderr,
+			status: result.status,
+			signal: result.signal,
+		});
+		throw error;
+	}
 }
 
 // ── Git Utilities ────────────────────────────────────────────
@@ -99,6 +124,27 @@ function getTrackedFiles(files: string[]): Set<string> {
 	// git ls-files silently omits untracked files from output
 	const output = git('ls-files', '--', ...files);
 	return new Set(output ? output.split('\n').filter(Boolean) : []);
+}
+
+/**
+ * After `git rm --cached <path>`, the removal is staged but the working tree
+ * copy often remains. Plain `git add <path>` would re-index that file and
+ * undo the staged deletion. Skip `git add` for those paths so the deletion
+ * stays staged (user can still commit the removal).
+ */
+function fileWouldReviveStagedDeletion({
+	relativePath,
+}: {
+	relativePath: string;
+}): boolean {
+	const staged = git('diff', '--cached', '--name-status', '--', relativePath);
+	const line = staged.split('\n')[0]?.trim() ?? '';
+	if (!line.startsWith('D')) return false;
+	return existsSync(resolve(process.cwd(), relativePath));
+}
+
+function pathsSafeForPlainGitAdd({ paths }: { paths: string[] }): string[] {
+	return paths.filter((p) => !fileWouldReviveStagedDeletion({ relativePath: p }));
 }
 
 function stageFiles(files: string[]): void {
@@ -278,8 +324,15 @@ program
 			const trackedFiles = getTrackedFiles(files);
 
 			try {
-				log(`Staging ${files.length} file(s): ${files.join(', ')}`);
-				stageFiles(files);
+				const toStage = pathsSafeForPlainGitAdd({ paths: files });
+				const skipped = files.filter((f: string) => !toStage.includes(f));
+				if (skipped.length > 0) {
+					log(
+						`Skipping git add for ${skipped.length} path(s) (staged deletion; on-disk file would re-add to index): ${skipped.join(', ')}`,
+					);
+				}
+				log(`Staging ${toStage.length} file(s): ${toStage.join(', ') || '(none — using existing index)'}`);
+				stageFiles(toStage);
 
 				const commitArgs = ['commit', '-m', message];
 				if (verify === false) commitArgs.push('--no-verify');
@@ -287,7 +340,14 @@ program
 				log('Committing...');
 				gitPassthrough(...commitArgs);
 				log('Commit successful.');
-			} catch {
+			} catch (err: any) {
+				const hasGitOutput = Boolean(
+					(err?.stdout && String(err.stdout).trim()) ||
+					(err?.stderr && String(err.stderr).trim()),
+				);
+				if (!hasGitOutput && err?.message) {
+					logError(`git commit failed: ${err.message}`);
+				}
 				logError('Commit failed — rolling back staging...');
 
 				const toUnstage = files.filter(
@@ -391,6 +451,7 @@ program
 		if (!info) {
 			log('No lock held.');
 			process.exit(0);
+			return;
 		}
 		const pidAlive = isPidAlive(info.pid);
 		const stale = isStale(info);

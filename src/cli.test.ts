@@ -6,12 +6,16 @@ import {
 	readFileSync,
 	rmSync,
 	existsSync,
+	chmodSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
 // ── Helpers ──────────────────────────────────────────────────
 
 const CLI = join(import.meta.dir, 'cli.ts');
+
+/** Allow raw git in tests when git-guardrails is installed (same bypass as the CLI). */
+const GIT_TEST_ENV = { ...process.env, GIT_ATOMIC_COMMIT: '1' };
 
 /** Run git-atomic-commit in a given cwd, return { stdout, stderr, exitCode } */
 function gac(
@@ -41,6 +45,7 @@ function gitCmd(...args: string[]): string {
 		encoding: 'utf-8',
 		cwd: tmpRepo,
 		stdio: 'pipe',
+		env: GIT_TEST_ENV,
 	}).trim();
 }
 
@@ -83,21 +88,28 @@ function createTestRepo(): string {
 		`repo-${++tmpCounter}`,
 	);
 	mkdirSync(dir, { recursive: true });
-	execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
+	execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe', env: GIT_TEST_ENV });
 	execFileSync('git', ['config', 'user.email', 'test@test.com'], {
 		cwd: dir,
 		stdio: 'pipe',
+		env: GIT_TEST_ENV,
 	});
 	execFileSync('git', ['config', 'user.name', 'Test'], {
 		cwd: dir,
 		stdio: 'pipe',
+		env: GIT_TEST_ENV,
 	});
 	// Initial commit so HEAD exists
 	writeFileSync(join(dir, '.gitkeep'), '');
-	execFileSync('git', ['add', '.gitkeep'], { cwd: dir, stdio: 'pipe' });
+	execFileSync('git', ['add', '.gitkeep'], {
+		cwd: dir,
+		stdio: 'pipe',
+		env: GIT_TEST_ENV,
+	});
 	execFileSync('git', ['commit', '-m', 'init'], {
 		cwd: dir,
 		stdio: 'pipe',
+		env: GIT_TEST_ENV,
 	});
 	return dir;
 }
@@ -191,6 +203,26 @@ describe('git-atomic-commit', () => {
 			expect(stagedFiles()).toEqual([]);
 		});
 
+		test('does not undo git rm --cached when the file still exists on disk', () => {
+			createFile('gone.txt', 'keep locally\n');
+			gitCmd('add', 'gone.txt');
+			gitCmd('commit', '-m', 'add gone', '--no-verify');
+			gitCmd('rm', '--cached', 'gone.txt');
+
+			expect(stagedFiles()).toContain('gone.txt');
+			expect(existsSync(join(tmpRepo, 'gone.txt'))).toBe(true);
+
+			const result = gac(
+				'commit -f gone.txt -m "test: remove from repo only" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Skipping git add');
+
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only');
+			expect(treeFiles.split('\n').filter(Boolean)).not.toContain('gone.txt');
+			expect(existsSync(join(tmpRepo, 'gone.txt'))).toBe(true);
+		});
+
 		test('does not release externally-held lock on commit failure', () => {
 			createFile('a.txt');
 
@@ -208,6 +240,31 @@ describe('git-atomic-commit', () => {
 
 			// Clean up
 			gac('unlock --force');
+		});
+
+		test('surfaces hook stdout and stderr when commit fails', () => {
+			createFile('a.txt');
+
+			const hookPath = join(tmpRepo, '.git', 'hooks', 'commit-msg');
+			writeFileSync(
+				hookPath,
+				[
+					'#!/bin/sh',
+					'echo "hook stdout: explain the failure"',
+					'echo "hook stderr: fix this specific problem" >&2',
+					'exit 1',
+					'',
+				].join('\n'),
+			);
+			chmodSync(hookPath, 0o755);
+
+			const result = gac('commit -f a.txt -m "test: hook failure surfaces details"');
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('hook stdout: explain the failure');
+			expect(result.stdout + result.stderr).toContain('hook stderr: fix this specific problem');
+			expect(result.stdout + result.stderr).toContain('rolling back');
+			expect(stagedFiles()).toEqual([]);
+			expect(lockExists()).toBe(false);
 		});
 	});
 
