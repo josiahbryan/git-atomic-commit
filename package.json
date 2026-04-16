@@ -20,6 +20,7 @@
     "cli"
   ],
   "scripts": {
+    "test": "bun test",
     "setup": "bun src/install.ts",
     "uninstall": "bun src/install.ts --uninstall"
   },

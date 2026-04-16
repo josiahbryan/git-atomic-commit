@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { Command } from 'commander';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import {
 	mkdirSync,
 	writeFileSync,
@@ -21,9 +21,9 @@ interface LockInfo {
 }
 
 const LOCK_DIR_NAME = 'atomic-commit.lock';
-const DEFAULT_TTL_ATOMIC = 60; // 1 min for atomic commit
-const DEFAULT_TTL_TRANSACTION = 600; // 10 min for multi-turn lock
-const STALE_PID_GRACE = 10; // seconds before dead-PID lock is stealable
+const DEFAULT_TTL_ATOMIC = 60;
+const DEFAULT_TTL_TRANSACTION = 600;
+const STALE_PID_GRACE = 10;
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -48,24 +48,32 @@ function safeAction(fn: (...args: any[]) => void) {
 	};
 }
 
-function run(cmd: string): string {
+function parseTtl(value: string): number {
+	const n = parseInt(value, 10);
+	if (isNaN(n) || n <= 0) {
+		throw new Error(`Invalid --ttl value "${value}". Must be a positive integer.`);
+	}
+	return n;
+}
+
+function git(...args: string[]): string {
 	try {
-		return execSync(cmd, { encoding: 'utf-8', stdio: 'pipe' }).trim();
+		return execFileSync('git', args, { encoding: 'utf-8', stdio: 'pipe' }).trim();
 	} catch (err: any) {
-		// Return stdout even on non-zero exit (some git commands do this)
 		if (err.stdout) return err.stdout.toString().trim();
 		throw err;
 	}
 }
 
-function runPassthrough(cmd: string): void {
-	execSync(cmd, { stdio: 'inherit' });
+function gitPassthrough(...args: string[]): void {
+	execFileSync('git', args, { stdio: 'inherit' });
 }
 
 // ── Git Utilities ────────────────────────────────────────────
 
+let _gitDir: string | undefined;
 function getGitDir(): string {
-	return run('git rev-parse --git-dir');
+	return (_gitDir ??= git('rev-parse', '--git-dir'));
 }
 
 function getLockDir(): string {
@@ -73,50 +81,40 @@ function getLockDir(): string {
 }
 
 function getStagedFiles(): string[] {
-	const output = run('git diff --name-only --staged');
+	const output = git('diff', '--name-only', '--staged');
 	return output ? output.split('\n').filter(Boolean) : [];
 }
 
 /** Returns the set of files git considers tracked (exist in HEAD) */
 function getTrackedFiles(files: string[]): Set<string> {
-	const tracked = new Set<string>();
-	for (const file of files) {
-		try {
-			// ls-files --error-unmatch exits non-zero for untracked files
-			run(`git ls-files --error-unmatch "${file}"`);
-			tracked.add(file);
-		} catch {
-			// Not tracked — skip
-		}
-	}
-	return tracked;
+	if (files.length === 0) return new Set();
+	// git ls-files silently omits untracked files from output
+	const output = git('ls-files', '--', ...files);
+	return new Set(output ? output.split('\n').filter(Boolean) : []);
 }
 
 function stageFiles(files: string[]): void {
-	for (const file of files) {
-		execSync(`git add "${file}"`, { stdio: 'pipe' });
-	}
+	if (files.length === 0) return;
+	execFileSync('git', ['add', '--', ...files], { stdio: 'pipe' });
 }
 
 /**
  * Unstage files, handling both tracked and new (untracked) files correctly.
- * - Tracked files: `git reset HEAD -- <file>` (removes staged diff)
- * - New files: `git rm --cached <file>` (removes from index, keeps working tree)
+ * - Tracked files: `git reset HEAD -- <files>` (removes staged diff)
+ * - New files: `git rm --cached <files>` (removes from index, keeps working tree)
  */
-function unstageFiles(
-	files: string[],
-	trackedFiles: Set<string>,
-): void {
-	for (const file of files) {
+function unstageFiles(files: string[], trackedFiles: Set<string>): void {
+	const tracked = files.filter((f) => trackedFiles.has(f));
+	const untracked = files.filter((f) => !trackedFiles.has(f));
+	if (tracked.length) {
 		try {
-			if (trackedFiles.has(file)) {
-				execSync(`git reset HEAD -- "${file}"`, { stdio: 'pipe' });
-			} else {
-				execSync(`git rm --cached "${file}"`, { stdio: 'pipe' });
-			}
-		} catch {
-			// Best effort — file might already be unstaged
-		}
+			execFileSync('git', ['reset', 'HEAD', '--', ...tracked], { stdio: 'pipe' });
+		} catch { /* best effort */ }
+	}
+	if (untracked.length) {
+		try {
+			execFileSync('git', ['rm', '--cached', '--', ...untracked], { stdio: 'pipe' });
+		} catch { /* best effort */ }
 	}
 }
 
@@ -124,7 +122,7 @@ function unstageFiles(
 
 function isPidAlive(pid: number): boolean {
 	try {
-		process.kill(pid, 0); // signal 0 = existence check, no actual signal sent
+		process.kill(pid, 0);
 		return true;
 	} catch {
 		return false;
@@ -148,9 +146,7 @@ function formatAge(info: LockInfo): string {
 
 function isStale(info: LockInfo): boolean {
 	const ageSeconds = (Date.now() - info.acquiredAt) / 1000;
-	// Primary: TTL expired
 	if (ageSeconds > info.ttlSeconds) return true;
-	// Secondary: owning process is dead and lock is past the grace period
 	if (!isPidAlive(info.pid) && ageSeconds > STALE_PID_GRACE) return true;
 	return false;
 }
@@ -159,12 +155,10 @@ function acquireLock(owner: string, ttlSeconds: number): void {
 	const lockDir = getLockDir();
 
 	try {
-		// mkdir is atomic on POSIX — exactly one caller wins the race
 		mkdirSync(lockDir);
 	} catch (err: any) {
 		if (err.code !== 'EEXIST') throw err;
 
-		// Lock exists — check if stale
 		const info = readLock();
 		if (info && !isStale(info)) {
 			throw new Error(
@@ -173,10 +167,19 @@ function acquireLock(owner: string, ttlSeconds: number): void {
 			);
 		}
 
-		// Stale — steal it
+		// Stale — steal it. Retry mkdir if another process races us.
 		log(`Removing stale lock from "${info?.owner ?? 'unknown'}"`);
 		rmSync(lockDir, { recursive: true });
-		mkdirSync(lockDir);
+		try {
+			mkdirSync(lockDir);
+		} catch (retryErr: any) {
+			if (retryErr.code === 'EEXIST') {
+				throw new Error(
+					'Lost lock race to another process while stealing stale lock. Retry.',
+				);
+			}
+			throw retryErr;
+		}
 	}
 
 	const lockInfo: LockInfo = {
@@ -238,56 +241,61 @@ program
 	)
 	.option('--no-verify', 'Skip pre-commit hooks')
 	.action(safeAction((opts) => {
-		const { files, message, owner, ttl, verify } = opts;
+		const { files, message, owner, verify } = opts;
+		const ttl = parseTtl(opts.ttl);
 
 		// Check if we already hold the lock (from a prior `lock` command)
 		const existing = readLock();
-		if (existing && existing.owner === owner && !isStale(existing)) {
+		const weAcquired = !(existing && existing.owner === owner && !isStale(existing));
+
+		if (!weAcquired) {
 			log(`Using existing lock (owner: "${owner}")`);
 		} else {
 			log(`Acquiring lock as "${owner}"...`);
-			acquireLock(owner, parseInt(ttl));
+			acquireLock(owner, ttl);
 			log('Lock acquired.');
 		}
 
-		// Snapshot what was staged BEFORE we touch the index
-		const priorStaged = getStagedFiles();
-		if (priorStaged.length > 0) {
-			log(
-				`Note: ${priorStaged.length} file(s) already staged: ${priorStaged.join(', ')}`,
-			);
-		}
-
-		// Record which of our files are already tracked (needed for correct rollback)
-		const trackedFiles = getTrackedFiles(files);
-
+		// Everything after lock acquisition is wrapped in try/finally
+		// so the lock is always released (if we acquired it) on any failure.
+		let commitFailed = false;
 		try {
-			log(`Staging ${files.length} file(s): ${files.join(', ')}`);
-			stageFiles(files);
+			const priorStaged = getStagedFiles();
+			if (priorStaged.length > 0) {
+				log(
+					`Note: ${priorStaged.length} file(s) already staged: ${priorStaged.join(', ')}`,
+				);
+			}
 
-			const verifyFlag = verify === false ? ' --no-verify' : '';
-			const commitCmd = `git commit${verifyFlag} -m ${JSON.stringify(message)}`;
+			const trackedFiles = getTrackedFiles(files);
 
-			log('Committing...');
-			runPassthrough(commitCmd);
-			log('Commit successful.');
-		} catch (err: any) {
-			logError('Commit failed — rolling back staging...');
+			try {
+				log(`Staging ${files.length} file(s): ${files.join(', ')}`);
+				stageFiles(files);
 
-			// Unstage ONLY files we added (preserve anything that was staged before us)
-			const toUnstage = files.filter(
-				(f: string) => !priorStaged.includes(f),
-			);
-			unstageFiles(toUnstage, trackedFiles);
-			log(`Rolled back ${toUnstage.length} file(s).`);
+				const commitArgs = ['commit', '-m', message];
+				if (verify === false) commitArgs.push('--no-verify');
 
-			releaseLock();
-			log('Lock released.');
-			process.exit(1);
+				log('Committing...');
+				gitPassthrough(...commitArgs);
+				log('Commit successful.');
+			} catch {
+				logError('Commit failed — rolling back staging...');
+
+				const toUnstage = files.filter(
+					(f: string) => !priorStaged.includes(f),
+				);
+				unstageFiles(toUnstage, trackedFiles);
+				log(`Rolled back ${toUnstage.length} file(s).`);
+				commitFailed = true;
+			}
+		} finally {
+			if (weAcquired) {
+				releaseLock();
+				log('Lock released.');
+			}
 		}
-
-		releaseLock();
-		log('Lock released.');
+		if (commitFailed) process.exit(1);
 	}));
 
 // ── lock ─────────────────────────────────────────────────────
@@ -306,9 +314,10 @@ program
 		String(DEFAULT_TTL_TRANSACTION),
 	)
 	.action(safeAction((opts) => {
-		const { owner, ttl } = opts;
+		const { owner } = opts;
+		const ttl = parseTtl(opts.ttl);
 		log(`Acquiring lock as "${owner}" (ttl: ${ttl}s)...`);
-		acquireLock(owner, parseInt(ttl));
+		acquireLock(owner, ttl);
 		log('Lock acquired.');
 	}));
 
@@ -348,13 +357,14 @@ program
 		String(DEFAULT_TTL_TRANSACTION),
 	)
 	.action(safeAction((opts) => {
-		const { owner, ttl } = opts;
+		const { owner } = opts;
+		const ttl = parseTtl(opts.ttl);
 		const info = verifyOwnership(owner);
 		const lockDir = getLockDir();
 		const renewed: LockInfo = {
 			...info,
 			acquiredAt: Date.now(),
-			ttlSeconds: parseInt(ttl),
+			ttlSeconds: ttl,
 		};
 		writeFileSync(
 			join(lockDir, 'lock.json'),
