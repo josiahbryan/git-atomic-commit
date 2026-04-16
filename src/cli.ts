@@ -56,9 +56,17 @@ function parseTtl(value: string): number {
 	return n;
 }
 
+// Env passed to all git subprocesses. GIT_ATOMIC_COMMIT=1 tells
+// git-guardrails (if installed) to allow these calls through.
+const GIT_ENV = { ...process.env, GIT_ATOMIC_COMMIT: '1' };
+
 function git(...args: string[]): string {
 	try {
-		return execFileSync('git', args, { encoding: 'utf-8', stdio: 'pipe' }).trim();
+		return execFileSync('git', args, {
+			encoding: 'utf-8',
+			stdio: 'pipe',
+			env: GIT_ENV,
+		}).trim();
 	} catch (err: any) {
 		if (err.stdout) return err.stdout.toString().trim();
 		throw err;
@@ -66,7 +74,7 @@ function git(...args: string[]): string {
 }
 
 function gitPassthrough(...args: string[]): void {
-	execFileSync('git', args, { stdio: 'inherit' });
+	execFileSync('git', args, { stdio: 'inherit', env: GIT_ENV });
 }
 
 // ── Git Utilities ────────────────────────────────────────────
@@ -95,7 +103,7 @@ function getTrackedFiles(files: string[]): Set<string> {
 
 function stageFiles(files: string[]): void {
 	if (files.length === 0) return;
-	execFileSync('git', ['add', '--', ...files], { stdio: 'pipe' });
+	execFileSync('git', ['add', '--', ...files], { stdio: 'pipe', env: GIT_ENV });
 }
 
 /**
@@ -108,12 +116,12 @@ function unstageFiles(files: string[], trackedFiles: Set<string>): void {
 	const untracked = files.filter((f) => !trackedFiles.has(f));
 	if (tracked.length) {
 		try {
-			execFileSync('git', ['reset', 'HEAD', '--', ...tracked], { stdio: 'pipe' });
+			execFileSync('git', ['reset', 'HEAD', '--', ...tracked], { stdio: 'pipe', env: GIT_ENV });
 		} catch { /* best effort */ }
 	}
 	if (untracked.length) {
 		try {
-			execFileSync('git', ['rm', '--cached', '--', ...untracked], { stdio: 'pipe' });
+			execFileSync('git', ['rm', '--cached', '--', ...untracked], { stdio: 'pipe', env: GIT_ENV });
 		} catch { /* best effort */ }
 	}
 }

@@ -20,9 +20,11 @@
     "cli"
   ],
   "scripts": {
+    "build": "bun build --compile --outfile dist/git-atomic-commit src/cli.ts",
     "test": "bun test",
-    "setup": "bun src/install.ts",
-    "uninstall": "bun src/install.ts --uninstall"
+    "setup": "bun run build && bash scripts/install.sh",
+    "uninstall": "bash scripts/uninstall.sh",
+    "release": "bash scripts/release.sh"
   },
   "dependencies": {
     "commander": "^12.0.0"

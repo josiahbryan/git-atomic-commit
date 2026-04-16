@@ -14,15 +14,27 @@ This tool wraps staging and committing into a single locked operation, like a da
 
 ## Install
 
-Requires [bun](https://bun.sh).
+### One-liner (recommended)
+
+No dependencies required — downloads a pre-compiled native binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/josiahbryan/git-atomic-commit/main/scripts/install-remote.sh | bash
+```
+
+Supports macOS (Apple Silicon + Intel) and Linux (x64 + ARM64).
+
+### From source
+
+Requires [bun](https://bun.sh):
 
 ```bash
 git clone https://github.com/josiahbryan/git-atomic-commit.git
 cd git-atomic-commit
-bun run setup
+bun install && bun run setup
 ```
 
-This installs `git-atomic-commit` to `/usr/local/bin/`. The installer is idempotent — safe to re-run after pulling updates.
+This compiles a native binary and installs it to `/usr/local/bin/`.
 
 ## Usage
 
@@ -141,8 +153,19 @@ The lock lives inside `.git/`, so different repos have independent locks. The lo
 
 ## Requirements
 
-- [bun](https://bun.sh) >= 1.0
-- git >= 2.23 (for `git restore --staged` support, though the tool falls back gracefully)
+- git >= 2.23
+- Pre-compiled binaries: no other dependencies
+- Building from source: [bun](https://bun.sh) >= 1.0
+
+## Uninstall
+
+```bash
+# If installed via one-liner or from source:
+bash scripts/uninstall.sh
+
+# Or manually:
+rm /usr/local/bin/git-atomic-commit
+```
 
 ## License
 
