@@ -7,6 +7,8 @@ import {
 	rmSync,
 	existsSync,
 	chmodSync,
+	symlinkSync,
+	lstatSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
@@ -173,7 +175,7 @@ describe('git-atomic-commit', () => {
 		test('surfaces git add pathspec errors before rollback', () => {
 			const result = gac('commit -f missing.txt -m "test: missing path surfaces error" --no-verify');
 			expect(result.exitCode).not.toBe(0);
-			expect(result.stdout + result.stderr).toContain("pathspec 'missing.txt' did not match any files");
+			expect(result.stdout + result.stderr).toContain("missing.txt");
 			expect(result.stdout + result.stderr).toContain('Atomic operation failed during staging');
 			expect(result.stdout + result.stderr).toContain('rolling back');
 			expect(result.stdout + result.stderr).not.toContain('Commit successful');
@@ -232,6 +234,126 @@ describe('git-atomic-commit', () => {
 			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only');
 			expect(treeFiles.split('\n').filter(Boolean)).not.toContain('gone.txt');
 			expect(existsSync(join(tmpRepo, 'gone.txt'))).toBe(true);
+		});
+
+		test('does not roll back a staged deletion that was skipped from git add', () => {
+			createFile('gone.txt', 'keep locally\n');
+			gitCmd('add', 'gone.txt');
+			gitCmd('commit', '-m', 'add gone', '--no-verify');
+			gitCmd('rm', '--cached', 'gone.txt');
+
+			const hookPath = join(tmpRepo, '.git', 'hooks', 'commit-msg');
+			writeFileSync(
+				hookPath,
+				[
+					'#!/bin/sh',
+					'echo "hook stderr: block commit" >&2',
+					'exit 1',
+					'',
+				].join('\n'),
+			);
+			chmodSync(hookPath, 0o755);
+
+			const result = gac(
+				'commit -f gone.txt -m "test: rollback preserves staged deletion"',
+			);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout).toContain('Skipping git add');
+			expect(result.stdout + result.stderr).toContain(
+				'Atomic operation failed during commit',
+			);
+			expect(stagedFiles()).toContain('gone.txt');
+			expect(existsSync(join(tmpRepo, 'gone.txt'))).toBe(true);
+		});
+
+		test('rejects directory inputs so staging stays file-exact', () => {
+			mkdirSync(join(tmpRepo, 'dir'));
+			createFile('dir/a.txt', 'hello\n');
+
+			const result = gac(
+				'commit -f dir -m "test: reject directory input" --no-verify',
+			);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain(
+				'--files only accepts literal file paths',
+			);
+			expect(result.stdout + result.stderr).toContain('dir');
+			expect(lockExists()).toBe(false);
+		});
+
+		test('treats glob-like inputs as literal filenames when the exact file exists', () => {
+			createFile('*.txt', 'literal star\n');
+			createFile('a.txt', 'normal file\n');
+
+			const result = gac(
+				'commit -f "*.txt" -m "test: literal pathspec filename" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Commit successful');
+
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only')
+				.split('\n')
+				.filter(Boolean);
+			expect(treeFiles).toContain('*.txt');
+			expect(treeFiles).not.toContain('a.txt');
+		});
+
+		test('does not treat deleted directory prefixes as broad matches', () => {
+			mkdirSync(join(tmpRepo, 'dir'));
+			createFile('dir/a.txt', 'a\n');
+			createFile('dir/b.txt', 'b\n');
+			gitCmd('add', 'dir/a.txt', 'dir/b.txt');
+			gitCmd('commit', '-m', 'add dir files', '--no-verify');
+			rmSync(join(tmpRepo, 'dir'), { recursive: true, force: true });
+
+			const result = gac(
+				'commit -f dir -m "test: deleted directory prefix stays invalid" --no-verify',
+			);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain(
+				'--files only accepts literal file paths',
+			);
+			expect(result.stdout + result.stderr).toContain('dir/a.txt');
+			expect(result.stdout + result.stderr).toContain('dir/b.txt');
+			expect(stagedFiles()).toEqual([]);
+			expect(lockExists()).toBe(false);
+		});
+
+		test('allows symlink paths even when they point to directories', () => {
+			mkdirSync(join(tmpRepo, 'target'));
+			createFile('target/a.txt', 'nested\n');
+			symlinkSync('target', join(tmpRepo, 'linkdir'));
+
+			const result = gac(
+				'commit -f linkdir -m "test: symlink stays exact path" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Commit successful');
+
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only')
+				.split('\n')
+				.filter(Boolean);
+			expect(treeFiles).toContain('linkdir');
+			expect(treeFiles).not.toContain('target/a.txt');
+		});
+
+		test('does not re-add dangling symlinks removed from the index', () => {
+			symlinkSync('missing-target', join(tmpRepo, 'broken-link'));
+			gitCmd('add', 'broken-link');
+			gitCmd('commit', '-m', 'add broken symlink', '--no-verify');
+			gitCmd('rm', '--cached', 'broken-link');
+
+			const result = gac(
+				'commit -f broken-link -m "test: remove broken symlink from repo only" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Skipping git add');
+
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only')
+				.split('\n')
+				.filter(Boolean);
+			expect(treeFiles).not.toContain('broken-link');
+			expect(lstatSync(join(tmpRepo, 'broken-link')).isSymbolicLink()).toBe(true);
 		});
 
 		test('does not release externally-held lock on commit failure', () => {

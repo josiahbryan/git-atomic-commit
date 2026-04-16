@@ -9,6 +9,7 @@ import {
 	readFileSync,
 	rmSync,
 	existsSync,
+	lstatSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -126,8 +127,104 @@ function getStagedFiles(): string[] {
 function getTrackedFiles(files: string[]): Set<string> {
 	if (files.length === 0) return new Set();
 	// git ls-files silently omits untracked files from output
-	const output = git('ls-files', '--', ...files);
+	const output = git('ls-files', '--', ...toLiteralPathspecs({ paths: files }));
 	return new Set(output ? output.split('\n').filter(Boolean) : []);
+}
+
+function toLiteralPathspec({
+	relativePath,
+}: {
+	relativePath: string;
+}): string {
+	return `:(literal)${relativePath}`;
+}
+
+function toLiteralPathspecs({ paths }: { paths: string[] }): string[] {
+	return paths.map((relativePath) => toLiteralPathspec({ relativePath }));
+}
+
+function getLiteralTrackedMatches({
+	relativePath,
+}: {
+	relativePath: string;
+}): string[] {
+	const output = git('ls-files', '--', toLiteralPathspec({ relativePath }));
+	return output ? output.split('\n').filter(Boolean) : [];
+}
+
+function getLiteralStagedMatches({
+	relativePath,
+}: {
+	relativePath: string;
+}): string[] {
+	const output = git(
+		'diff',
+		'--cached',
+		'--name-only',
+		'--',
+		toLiteralPathspec({ relativePath }),
+	);
+	return output ? output.split('\n').filter(Boolean) : [];
+}
+
+function getNonExactLiteralMatches({
+	relativePath,
+}: {
+	relativePath: string;
+}): string[] {
+	const matches = new Set([
+		...getLiteralTrackedMatches({ relativePath }),
+		...getLiteralStagedMatches({ relativePath }),
+	]);
+	return [...matches].filter((match) => match !== relativePath);
+}
+
+function pathExistsIncludingBrokenSymlink({
+	relativePath,
+}: {
+	relativePath: string;
+}): boolean {
+	try {
+		lstatSync(resolve(process.cwd(), relativePath));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function isDirectoryInput({
+	relativePath,
+}: {
+	relativePath: string;
+}): boolean {
+	const absolutePath = resolve(process.cwd(), relativePath);
+	return pathExistsIncludingBrokenSymlink({ relativePath }) && lstatSync(absolutePath).isDirectory();
+}
+
+/**
+ * This command deliberately stages exact file paths instead of supporting
+ * arbitrary git pathspecs. That keeps the atomic contract predictable and
+ * avoids broad inputs like `dir` accidentally staging or skipping unrelated
+ * changes.
+ */
+function validateLiteralFileInputs({ paths }: { paths: string[] }): void {
+	const directoryInputs = paths.filter((relativePath) => isDirectoryInput({ relativePath }));
+	if (directoryInputs.length > 0) {
+		throw new Error(
+			`--files only accepts literal file paths. Directory inputs are not allowed: ${directoryInputs.join(', ')}`,
+		);
+	}
+
+	for (const relativePath of paths) {
+		if (pathExistsIncludingBrokenSymlink({ relativePath })) continue;
+
+		const nonExactMatches = getNonExactLiteralMatches({ relativePath });
+		if (nonExactMatches.length === 0) continue;
+
+		throw new Error(
+			`--files only accepts literal file paths. "${relativePath}" matches entries underneath it instead of one exact file: ${nonExactMatches.join(', ')}`,
+		);
+	}
 }
 
 /**
@@ -141,10 +238,16 @@ function fileWouldReviveStagedDeletion({
 }: {
 	relativePath: string;
 }): boolean {
-	const staged = git('diff', '--cached', '--name-status', '--', relativePath);
+	const staged = git(
+		'diff',
+		'--cached',
+		'--name-status',
+		'--',
+		toLiteralPathspec({ relativePath }),
+	);
 	const line = staged.split('\n')[0]?.trim() ?? '';
 	if (!line.startsWith('D')) return false;
-	return existsSync(resolve(process.cwd(), relativePath));
+	return pathExistsIncludingBrokenSymlink({ relativePath });
 }
 
 function pathsSafeForPlainGitAdd({ paths }: { paths: string[] }): string[] {
@@ -153,7 +256,7 @@ function pathsSafeForPlainGitAdd({ paths }: { paths: string[] }): string[] {
 
 function stageFiles(files: string[]): void {
 	if (files.length === 0) return;
-	gitCaptureAndReplay('add', '--', ...files);
+	gitCaptureAndReplay('add', '--', ...toLiteralPathspecs({ paths: files }));
 }
 
 /**
@@ -166,12 +269,20 @@ function unstageFiles(files: string[], trackedFiles: Set<string>): void {
 	const untracked = files.filter((f) => !trackedFiles.has(f));
 	if (tracked.length) {
 		try {
-			execFileSync('git', ['reset', 'HEAD', '--', ...tracked], { stdio: 'pipe', env: GIT_ENV });
+			execFileSync(
+				'git',
+				['reset', 'HEAD', '--', ...toLiteralPathspecs({ paths: tracked })],
+				{ stdio: 'pipe', env: GIT_ENV },
+			);
 		} catch { /* best effort */ }
 	}
 	if (untracked.length) {
 		try {
-			execFileSync('git', ['rm', '--cached', '--', ...untracked], { stdio: 'pipe', env: GIT_ENV });
+			execFileSync(
+				'git',
+				['rm', '--cached', '--', ...toLiteralPathspecs({ paths: untracked })],
+				{ stdio: 'pipe', env: GIT_ENV },
+			);
 		} catch { /* best effort */ }
 	}
 }
@@ -301,6 +412,7 @@ program
 	.action(safeAction((opts) => {
 		const { files, message, owner, verify } = opts;
 		const ttl = parseTtl(opts.ttl);
+		validateLiteralFileInputs({ paths: files });
 
 		// Check if we already hold the lock (from a prior `lock` command)
 		const existing = readLock();
