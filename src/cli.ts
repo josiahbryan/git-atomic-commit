@@ -13,6 +13,8 @@ import {
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 
+import packageJson from '../package.json';
+
 // ── Types & Constants ────────────────────────────────────────
 
 interface LockInfo {
@@ -387,7 +389,7 @@ program
 	.description(
 		'Atomic git stage+commit with repo-wide locking for multi-agent safety',
 	)
-	.version('1.0.0');
+	.version(packageJson.version);
 
 // ── commit ───────────────────────────────────────────────────
 
