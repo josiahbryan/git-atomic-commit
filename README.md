@@ -151,6 +151,20 @@ The lock lives inside `.git/`, so different repos have independent locks. The lo
 | `status` | Show current lock state |
 | `break-lock` | Force-remove a stuck lock |
 
+## Recommended: Pair with git-guardrails
+
+[git-guardrails](https://github.com/josiahbryan/git-guardrails) is a companion tool that blocks dangerous git operations (`git stash`, `git reset --hard`, `git checkout .`, etc.) from AI agents and scripts. When git-guardrails detects that git-atomic-commit is installed, it automatically enforces its usage — blocking raw `git add` + `git commit` and requiring agents to use `git-atomic-commit` instead.
+
+Install git-guardrails:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/josiahbryan/git-guardrails/main/scripts/install-remote.sh | bash
+```
+
+Together, the two tools provide a safety net for multi-agent workflows:
+- **git-guardrails** prevents destructive operations and enforces atomic commits
+- **git-atomic-commit** prevents staging-area race conditions between concurrent agents
+
 ## Requirements
 
 - git >= 2.23
