@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-04-16
+
+### Changed
+
+- `--wait` now sleeps a random 2–8 seconds between attempts instead of a fixed 3s. When multiple waiters are released by the same `unlock`, the jitter decorrelates them on subsequent polls so they stop colliding on identical ticks.
+
 ## [1.3.1] - 2026-04-16
 
 ### Fixed

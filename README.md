@@ -89,7 +89,7 @@ git-atomic-commit unlock -o "my-session"
 
 ### Waiting for the lock
 
-Both `commit` and `lock` accept `--wait <seconds>`. When set, the command polls every 3 seconds for the lock and only fails if it can't be acquired within the timeout. Without `--wait`, the command fails immediately if the lock is held.
+Both `commit` and `lock` accept `--wait <seconds>`. When set, the command polls with a jittered 2–8s interval for the lock and only fails if it can't be acquired within the timeout. Jitter prevents thundering-herd collisions when several waiters were all released by the same `unlock`. Without `--wait`, the command fails immediately if the lock is held.
 
 ```bash
 # Wait up to 10 minutes before giving up

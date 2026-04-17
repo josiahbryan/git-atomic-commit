@@ -28,7 +28,10 @@ const LOCK_DIR_NAME = 'atomic-commit.lock';
 const DEFAULT_TTL_ATOMIC = 60;
 const DEFAULT_TTL_TRANSACTION = 600;
 const STALE_PID_GRACE = 10;
-const LOCK_WAIT_POLL_MS = 3000;
+// Jittered poll interval — prevents thundering herd when multiple waiters
+// synchronize on the same tick after a release.
+const LOCK_WAIT_POLL_MIN_MS = 2000;
+const LOCK_WAIT_POLL_MAX_MS = 8000;
 // Sentinel PID for multi-turn `lock` commands — the acquiring CLI exits
 // immediately, so its pid would always look dead. Detached locks rely on
 // TTL alone for staleness.
@@ -85,6 +88,11 @@ function sleepSync(ms: number): void {
 	if (ms <= 0) return;
 	const buf = new Int32Array(new SharedArrayBuffer(4));
 	Atomics.wait(buf, 0, 0, ms);
+}
+
+function jitteredPollMs(): number {
+	const span = LOCK_WAIT_POLL_MAX_MS - LOCK_WAIT_POLL_MIN_MS;
+	return LOCK_WAIT_POLL_MIN_MS + Math.floor(Math.random() * (span + 1));
 }
 
 // Env passed to all git subprocesses. GIT_ATOMIC_COMMIT=1 tells
@@ -418,11 +426,11 @@ function acquireLockWithWait({
 			if (waitSeconds <= 0 || now >= deadline) throw err;
 			if (!announced) {
 				log(
-					`Lock held by "${err.info.owner}" — polling every ${LOCK_WAIT_POLL_MS / 1000}s for up to ${waitSeconds}s...`,
+					`Lock held by "${err.info.owner}" — polling every ${LOCK_WAIT_POLL_MIN_MS / 1000}-${LOCK_WAIT_POLL_MAX_MS / 1000}s (jittered) for up to ${waitSeconds}s...`,
 				);
 				announced = true;
 			}
-			sleepSync(Math.min(LOCK_WAIT_POLL_MS, deadline - now));
+			sleepSync(Math.min(jitteredPollMs(), deadline - now));
 		}
 	}
 }
