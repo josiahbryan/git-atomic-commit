@@ -62,6 +62,7 @@ No manual cleanup needed. Fix the issue and re-run.
 -m, --message <message>  Commit message (required)
 -o, --owner <owner>      Lock owner identifier (default: pid-<PID>)
 -t, --ttl <seconds>      Lock TTL in seconds (default: 60)
+-w, --wait <seconds>     Poll for the lock up to N seconds before failing (default: 0, fail immediately)
 --no-verify              Skip pre-commit hooks
 ```
 
@@ -84,6 +85,18 @@ git-atomic-commit commit -o "my-session" \
 
 # Or abort without committing
 git-atomic-commit unlock -o "my-session"
+```
+
+### Waiting for the lock
+
+Both `commit` and `lock` accept `--wait <seconds>`. When set, the command polls every 3 seconds for the lock and only fails if it can't be acquired within the timeout. Without `--wait`, the command fails immediately if the lock is held.
+
+```bash
+# Wait up to 10 minutes before giving up
+git-atomic-commit commit -f src/foo.ts -m "feat: foo" --wait 600
+
+# Same for transaction-style locks
+git-atomic-commit lock -o "my-session" --wait 60
 ```
 
 ### Inspecting locks

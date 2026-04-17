@@ -28,6 +28,14 @@ const LOCK_DIR_NAME = 'atomic-commit.lock';
 const DEFAULT_TTL_ATOMIC = 60;
 const DEFAULT_TTL_TRANSACTION = 600;
 const STALE_PID_GRACE = 10;
+const LOCK_WAIT_POLL_MS = 3000;
+
+class LockHeldError extends Error {
+	constructor(public info: LockInfo, message: string) {
+		super(message);
+		this.name = 'LockHeldError';
+	}
+}
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -58,6 +66,21 @@ function parseTtl(value: string): number {
 		throw new Error(`Invalid --ttl value "${value}". Must be a positive integer.`);
 	}
 	return n;
+}
+
+function parseWait(value: string): number {
+	const n = parseInt(value, 10);
+	if (isNaN(n) || n < 0) {
+		throw new Error(`Invalid --wait value "${value}". Must be a non-negative integer.`);
+	}
+	return n;
+}
+
+/** Sync sleep via Atomics.wait so we don't spin the CPU while polling. */
+function sleepSync(ms: number): void {
+	if (ms <= 0) return;
+	const buf = new Int32Array(new SharedArrayBuffer(4));
+	Atomics.wait(buf, 0, 0, ms);
 }
 
 // Env passed to all git subprocesses. GIT_ATOMIC_COMMIT=1 tells
@@ -332,9 +355,10 @@ function acquireLock(owner: string, ttlSeconds: number): void {
 
 		const info = readLock();
 		if (info && !isStale(info)) {
-			throw new Error(
+			throw new LockHeldError(
+				info,
 				`Lock held by "${info.owner}" (pid ${info.pid}, age ${formatAge(info)}s, ttl ${info.ttlSeconds}s). ` +
-					`Use 'status' to inspect or 'break-lock' to force-remove.`,
+					`Use 'status' to inspect, '--wait <seconds>' to poll, or 'break-lock' to force-remove.`,
 			);
 		}
 
@@ -363,6 +387,36 @@ function acquireLock(owner: string, ttlSeconds: number): void {
 		join(lockDir, 'lock.json'),
 		JSON.stringify(lockInfo, null, 2),
 	);
+}
+
+function acquireLockWithWait({
+	owner,
+	ttlSeconds,
+	waitSeconds,
+}: {
+	owner: string;
+	ttlSeconds: number;
+	waitSeconds: number;
+}): void {
+	const deadline = Date.now() + waitSeconds * 1000;
+	let announced = false;
+	while (true) {
+		try {
+			acquireLock(owner, ttlSeconds);
+			return;
+		} catch (err) {
+			if (!(err instanceof LockHeldError)) throw err;
+			const now = Date.now();
+			if (waitSeconds <= 0 || now >= deadline) throw err;
+			if (!announced) {
+				log(
+					`Lock held by "${err.info.owner}" — polling every ${LOCK_WAIT_POLL_MS / 1000}s for up to ${waitSeconds}s...`,
+				);
+				announced = true;
+			}
+			sleepSync(Math.min(LOCK_WAIT_POLL_MS, deadline - now));
+		}
+	}
 }
 
 function releaseLock(): void {
@@ -411,9 +465,15 @@ program
 		String(DEFAULT_TTL_ATOMIC),
 	)
 	.option('--no-verify', 'Skip pre-commit hooks')
+	.option(
+		'-w, --wait <seconds>',
+		'Poll for the lock up to this many seconds before failing (default: 0, fail immediately)',
+		'0',
+	)
 	.action(safeAction((opts) => {
 		const { files, message, owner, verify } = opts;
 		const ttl = parseTtl(opts.ttl);
+		const waitSeconds = parseWait(opts.wait);
 		validateLiteralFileInputs({ paths: files });
 
 		// Check if we already hold the lock (from a prior `lock` command)
@@ -424,7 +484,7 @@ program
 			log(`Using existing lock (owner: "${owner}")`);
 		} else {
 			log(`Acquiring lock as "${owner}"...`);
-			acquireLock(owner, ttl);
+			acquireLockWithWait({ owner, ttlSeconds: ttl, waitSeconds });
 			log('Lock acquired.');
 		}
 
@@ -503,11 +563,17 @@ program
 		'Lock TTL in seconds',
 		String(DEFAULT_TTL_TRANSACTION),
 	)
+	.option(
+		'-w, --wait <seconds>',
+		'Poll for the lock up to this many seconds before failing (default: 0, fail immediately)',
+		'0',
+	)
 	.action(safeAction((opts) => {
 		const { owner } = opts;
 		const ttl = parseTtl(opts.ttl);
+		const waitSeconds = parseWait(opts.wait);
 		log(`Acquiring lock as "${owner}" (ttl: ${ttl}s)...`);
-		acquireLock(owner, ttl);
+		acquireLockWithWait({ owner, ttlSeconds: ttl, waitSeconds });
 		log('Lock acquired.');
 	}));
 

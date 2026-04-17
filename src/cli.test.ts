@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { execSync, execFileSync } from 'node:child_process';
+import { execSync, execFileSync, spawn } from 'node:child_process';
 import {
 	mkdirSync,
 	writeFileSync,
@@ -427,6 +427,63 @@ describe('git-atomic-commit', () => {
 
 			gac('unlock --force');
 		});
+
+		test('--wait times out if lock is never released', () => {
+			gac('lock -o "agent-1" -t 60');
+
+			const start = Date.now();
+			const result = gac('lock -o "agent-2" --wait 2');
+			const elapsedMs = Date.now() - start;
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('Lock held by "agent-1"');
+			// Should have waited roughly the full timeout (poll interval is 3s,
+			// so a 2s wait sleeps once for ~2s before giving up).
+			expect(elapsedMs).toBeGreaterThanOrEqual(1800);
+
+			gac('unlock --force');
+		});
+
+		/**
+		 * Schedule `gac` to run in a detached subprocess after `delayMs`.
+		 * Needed because the main test thread is blocking inside a sync
+		 * `gac()` call while waiting, so setTimeout would never fire.
+		 */
+		function scheduleGac(args: string, delayMs: number): void {
+			const child = spawn(
+				'sh',
+				['-c', `sleep ${delayMs / 1000} && bun "${CLI}" ${args}`],
+				{ cwd: tmpRepo, detached: true, stdio: 'ignore', env: GIT_TEST_ENV },
+			);
+			child.unref();
+		}
+
+		test('--wait acquires the lock once the holder releases it', () => {
+			gac('lock -o "agent-1" -t 60');
+			scheduleGac('unlock --force', 1000);
+
+			const result = gac('lock -o "agent-2" --wait 10');
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Lock acquired');
+
+			const info = readLockInfo();
+			expect(info.owner).toBe('agent-2');
+
+			gac('unlock --force');
+		}, 20000);
+
+		test('commit --wait blocks until the holder releases the lock', () => {
+			createFile('a.txt');
+			gac('lock -o "holder"');
+			scheduleGac('unlock --force', 1000);
+
+			const result = gac(
+				'commit -f a.txt -m "test: commit waits for lock" --wait 10 --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Commit successful');
+			expect(lockExists()).toBe(false);
+		}, 20000);
 
 		test('steals stale lock (TTL expired)', () => {
 			// Manually create an expired lock

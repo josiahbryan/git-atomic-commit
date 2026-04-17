@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-04-16
+
+### Added
+
+- `--wait <seconds>` / `-w` option on `commit` and `lock`. When set, the command polls every 3 seconds for the lock and only fails if it can't be acquired within the timeout. Default `0` preserves the existing fail-immediately behavior.
+- `LockHeldError` class so the wait loop can retry only on "lock held by another owner" and let other errors propagate.
+- `sleepSync` helper using `Atomics.wait` (no CPU spin while polling).
+- Tests covering `--wait` timeout, `lock --wait` acquiring after release, and `commit --wait` acquiring after release.
+
 ## [1.2.0] - 2026-04-16
 
 ### Fixed
