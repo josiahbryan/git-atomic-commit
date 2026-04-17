@@ -29,6 +29,10 @@ const DEFAULT_TTL_ATOMIC = 60;
 const DEFAULT_TTL_TRANSACTION = 600;
 const STALE_PID_GRACE = 10;
 const LOCK_WAIT_POLL_MS = 3000;
+// Sentinel PID for multi-turn `lock` commands — the acquiring CLI exits
+// immediately, so its pid would always look dead. Detached locks rely on
+// TTL alone for staleness.
+const DETACHED_PID = -1;
 
 class LockHeldError extends Error {
 	constructor(public info: LockInfo, message: string) {
@@ -341,11 +345,12 @@ function formatAge(info: LockInfo): string {
 function isStale(info: LockInfo): boolean {
 	const ageSeconds = (Date.now() - info.acquiredAt) / 1000;
 	if (ageSeconds > info.ttlSeconds) return true;
+	if (info.pid === DETACHED_PID) return false;
 	if (!isPidAlive(info.pid) && ageSeconds > STALE_PID_GRACE) return true;
 	return false;
 }
 
-function acquireLock(owner: string, ttlSeconds: number): void {
+function acquireLock(owner: string, ttlSeconds: number, detached = false): void {
 	const lockDir = getLockDir();
 
 	try {
@@ -355,9 +360,10 @@ function acquireLock(owner: string, ttlSeconds: number): void {
 
 		const info = readLock();
 		if (info && !isStale(info)) {
+			const pidLabel = info.pid === DETACHED_PID ? 'detached' : `pid ${info.pid}`;
 			throw new LockHeldError(
 				info,
-				`Lock held by "${info.owner}" (pid ${info.pid}, age ${formatAge(info)}s, ttl ${info.ttlSeconds}s). ` +
+				`Lock held by "${info.owner}" (${pidLabel}, age ${formatAge(info)}s, ttl ${info.ttlSeconds}s). ` +
 					`Use 'status' to inspect, '--wait <seconds>' to poll, or 'break-lock' to force-remove.`,
 			);
 		}
@@ -379,7 +385,7 @@ function acquireLock(owner: string, ttlSeconds: number): void {
 
 	const lockInfo: LockInfo = {
 		owner,
-		pid: process.pid,
+		pid: detached ? DETACHED_PID : process.pid,
 		acquiredAt: Date.now(),
 		ttlSeconds,
 	};
@@ -393,16 +399,18 @@ function acquireLockWithWait({
 	owner,
 	ttlSeconds,
 	waitSeconds,
+	detached = false,
 }: {
 	owner: string;
 	ttlSeconds: number;
 	waitSeconds: number;
+	detached?: boolean;
 }): void {
 	const deadline = Date.now() + waitSeconds * 1000;
 	let announced = false;
 	while (true) {
 		try {
-			acquireLock(owner, ttlSeconds);
+			acquireLock(owner, ttlSeconds, detached);
 			return;
 		} catch (err) {
 			if (!(err instanceof LockHeldError)) throw err;
@@ -573,7 +581,7 @@ program
 		const ttl = parseTtl(opts.ttl);
 		const waitSeconds = parseWait(opts.wait);
 		log(`Acquiring lock as "${owner}" (ttl: ${ttl}s)...`);
-		acquireLockWithWait({ owner, ttlSeconds: ttl, waitSeconds });
+		acquireLockWithWait({ owner, ttlSeconds: ttl, waitSeconds, detached: true });
 		log('Lock acquired.');
 	}));
 
@@ -641,10 +649,13 @@ program
 			process.exit(0);
 			return;
 		}
-		const pidAlive = isPidAlive(info.pid);
 		const stale = isStale(info);
 		log(`Owner:  ${info.owner}`);
-		log(`PID:    ${info.pid} (${pidAlive ? 'alive' : 'dead'})`);
+		if (info.pid === DETACHED_PID) {
+			log('PID:    (detached — multi-turn lock)');
+		} else {
+			log(`PID:    ${info.pid} (${isPidAlive(info.pid) ? 'alive' : 'dead'})`);
+		}
 		log(`Age:    ${formatAge(info)}s / ${info.ttlSeconds}s TTL`);
 		log(`Status: ${stale ? 'STALE (safe to steal or break)' : 'ACTIVE'}`);
 	}));

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-04-16
+
+### Fixed
+
+- Multi-turn locks (`lock` → work → `commit -o <owner>` → `unlock`) no longer break after ~10 seconds. The `lock` command's PID was the short-lived CLI subprocess that exits immediately after acquiring, so the old PID-alive staleness heuristic incorrectly flagged the lock as stale past `STALE_PID_GRACE` (10s). Any owner — including the session itself — could then steal the lock, and `commit -o <owner>` would silently steal-and-release instead of reusing. Locks acquired by the `lock` command now store a detached-PID sentinel (`-1`) and rely on TTL alone for staleness. Crash recovery for one-shot `commit` still uses real process PIDs.
+- `status` now shows `(detached — multi-turn lock)` for locks held by the `lock` command, and `LockHeldError` messages label detached locks clearly instead of printing `pid -1`.
+
 ## [1.3.0] - 2026-04-16
 
 ### Added

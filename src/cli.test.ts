@@ -413,7 +413,8 @@ describe('git-atomic-commit', () => {
 			const info = readLockInfo();
 			expect(info.owner).toBe('agent-1');
 			expect(info.ttlSeconds).toBe(120);
-			expect(info.pid).toBeGreaterThan(0);
+			// Multi-turn locks store a sentinel PID so they survive the CLI exiting.
+			expect(info.pid).toBe(-1);
 
 			gac('unlock --force');
 		});
@@ -484,6 +485,69 @@ describe('git-atomic-commit', () => {
 			expect(result.stdout).toContain('Commit successful');
 			expect(lockExists()).toBe(false);
 		}, 20000);
+
+		test('lock stores a detached pid so the lock outlives the acquiring CLI process', () => {
+			gac('lock -o "session-1" -t 60');
+			const info = readLockInfo();
+			expect(info.pid).toBe(-1);
+			gac('unlock --force');
+		});
+
+		test('detached lock is not stolen just because the acquiring CLI exited', () => {
+			gac('lock -o "session-1" -t 60');
+
+			// Simulate time passing: age the lock past STALE_PID_GRACE (10s)
+			// and beyond a point where the PID-death heuristic would fire.
+			const lockFile = join(lockDir(), 'lock.json');
+			const info = JSON.parse(readFileSync(lockFile, 'utf-8'));
+			info.acquiredAt = Date.now() - 30_000;
+			writeFileSync(lockFile, JSON.stringify(info));
+
+			const result = gac('lock -o "other-session"');
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('Lock held by "session-1"');
+
+			gac('unlock --force');
+		});
+
+		test('commit -o <owner> reuses a detached session lock even after it ages past PID grace', () => {
+			createFile('a.txt');
+			gac('lock -o "session-1" -t 60');
+
+			// Age the lock past STALE_PID_GRACE so the old PID-death heuristic
+			// would incorrectly mark it stale.
+			const lockFile = join(lockDir(), 'lock.json');
+			const info = JSON.parse(readFileSync(lockFile, 'utf-8'));
+			info.acquiredAt = Date.now() - 30_000;
+			writeFileSync(lockFile, JSON.stringify(info));
+
+			const result = gac(
+				'commit -o "session-1" -f a.txt -m "test: reuse aged session lock" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Using existing lock');
+			// Multi-turn contract: commit using an externally-held lock must not release it.
+			expect(lockExists()).toBe(true);
+
+			gac('unlock -o "session-1"');
+		});
+
+		test('TTL expiry still makes a detached lock stealable', () => {
+			gac('lock -o "session-1" -t 60');
+
+			// TTL expired: age past 60s
+			const lockFile = join(lockDir(), 'lock.json');
+			const info = JSON.parse(readFileSync(lockFile, 'utf-8'));
+			info.acquiredAt = Date.now() - 120_000;
+			writeFileSync(lockFile, JSON.stringify(info));
+
+			const result = gac('lock -o "session-2"');
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('stale');
+			expect(readLockInfo().owner).toBe('session-2');
+
+			gac('unlock --force');
+		});
 
 		test('steals stale lock (TTL expired)', () => {
 			// Manually create an expired lock
