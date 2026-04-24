@@ -400,6 +400,48 @@ describe('git-atomic-commit', () => {
 			expect(stagedFiles()).toEqual([]);
 			expect(lockExists()).toBe(false);
 		});
+
+		/**
+		 * Regression: when the user hits Ctrl+C during a slow pre-commit
+		 * hook, the lock must be cleared before the process dies. Without
+		 * an installed SIGINT handler, Node's default action for SIGINT is
+		 * to terminate the process — so the try/finally that releases the
+		 * lock never runs and the lock dir lingers until TTL expiry.
+		 *
+		 * `detached: true` puts the child in its own process group, so
+		 * `process.kill(-pid, 'SIGINT')` hits both bun and git — matching
+		 * how a terminal Ctrl+C signals the whole foreground group.
+		 */
+		test('Ctrl+C during pre-commit hook releases the lock', async () => {
+			createFile('a.txt');
+
+			const hookPath = join(tmpRepo, '.git', 'hooks', 'pre-commit');
+			writeFileSync(
+				hookPath,
+				'#!/bin/sh\nsleep 30\n',
+			);
+			chmodSync(hookPath, 0o755);
+
+			const child = spawn(
+				'bun',
+				[CLI, 'commit', '-f', 'a.txt', '-m', 'test: sigint cleanup'],
+				{ cwd: tmpRepo, detached: true, stdio: 'pipe', env: GIT_TEST_ENV },
+			);
+
+			// Wait long enough for the lock to be acquired and for
+			// spawnSync to be blocked inside the sleeping hook.
+			await new Promise((r) => setTimeout(r, 2500));
+			expect(lockExists()).toBe(true);
+
+			process.kill(-child.pid!, 'SIGINT');
+
+			await new Promise<void>((resolve) => {
+				child.on('exit', () => resolve());
+			});
+
+			expect(lockExists()).toBe(false);
+			expect(stagedFiles()).toEqual([]);
+		}, 15000);
 	});
 
 	// ── lock / unlock ────────────────────────────────────────

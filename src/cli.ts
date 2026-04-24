@@ -451,6 +451,57 @@ function verifyOwnership(owner: string): LockInfo {
 	return info;
 }
 
+// Signals that should release the lock and terminate. SIGINT is Ctrl+C,
+// SIGTERM is `kill`, SIGHUP is terminal close / parent exit.
+const CLEANUP_SIGNALS: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+/**
+ * Install signal handlers that release our lock before the process dies.
+ * Without this, Ctrl+C during a long pre-commit hook would kill the Bun
+ * process via Node's default SIGINT handler (exit 130) *before* the
+ * try/finally around the commit can release the lock — leaving a stale
+ * lock directory behind.
+ *
+ * Only the caller that acquired the lock should install these; multi-turn
+ * callers (external lock) must not clear someone else's lock.
+ *
+ * Returns a disposer that removes the handlers when normal cleanup runs.
+ */
+function installLockCleanupHandlers({ owner }: { owner: string }): () => void {
+	const handler = (signal: NodeJS.Signals) => {
+		try {
+			// Only release if we still own the lock — defensive in case
+			// something else already broke/stole it during the hook run.
+			const info = readLock();
+			if (info && info.owner === owner) {
+				releaseLock();
+				logError(`Interrupted by ${signal} — lock released.`);
+			} else {
+				logError(`Interrupted by ${signal}.`);
+			}
+		} catch {
+			// Swallow — we're already terminating; don't mask the signal exit.
+		}
+		// Conventional exit code for signal-terminated processes.
+		const signalNumbers: Record<string, number> = {
+			SIGINT: 2,
+			SIGTERM: 15,
+			SIGHUP: 1,
+		};
+		process.exit(128 + (signalNumbers[signal] ?? 0));
+	};
+
+	for (const signal of CLEANUP_SIGNALS) {
+		process.on(signal, handler);
+	}
+
+	return () => {
+		for (const signal of CLEANUP_SIGNALS) {
+			process.off(signal, handler);
+		}
+	};
+}
+
 // ── CLI ──────────────────────────────────────────────────────
 
 const program = new Command();
@@ -503,6 +554,14 @@ program
 			acquireLockWithWait({ owner, ttlSeconds: ttl, waitSeconds });
 			log('Lock acquired.');
 		}
+
+		// Register signal handlers so Ctrl+C (e.g. during a slow pre-commit
+		// hook) releases the lock before the process dies. Only install when
+		// we acquired the lock — a caller holding a multi-turn lock should
+		// not have their lock cleared by our interrupt.
+		const uninstallSignalHandlers = weAcquired
+			? installLockCleanupHandlers({ owner })
+			: () => {};
 
 		// Everything after lock acquisition is wrapped in try/finally
 		// so the lock is always released (if we acquired it) on any failure.
@@ -560,6 +619,7 @@ program
 				releaseLock();
 				log('Lock released.');
 			}
+			uninstallSignalHandlers();
 		}
 		if (commitFailed) process.exit(1);
 	}));

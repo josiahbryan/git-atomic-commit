@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-04-24
+
+### Fixed
+
+- Ctrl+C (and `SIGTERM` / `SIGHUP`) during a `commit` — typically while waiting on a slow pre-commit hook — now releases the lock before the process dies. Previously, Node's default `SIGINT` handler terminated the CLI with exit 130 *before* the `try/finally` around the commit could run, leaving a stale `.git/atomic-commit.lock/` directory until TTL expiry. The handler is only installed when this invocation acquired the lock, so multi-turn callers holding an external lock (`lock` → work → `commit -o <owner>` → `unlock`) are unaffected. Ownership is verified inside the handler so nothing gets cleared if another process already broke or stole the lock.
+
 ## [1.3.2] - 2026-04-16
 
 ### Changed
