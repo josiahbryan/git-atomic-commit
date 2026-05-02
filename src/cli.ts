@@ -155,9 +155,197 @@ function getLockDir(): string {
 	return join(resolve(getGitDir()), LOCK_DIR_NAME);
 }
 
-function getStagedFiles(): string[] {
-	const output = git('diff', '--name-only', '--staged');
-	return output ? output.split('\n').filter(Boolean) : [];
+/**
+ * One staged path with its index-vs-HEAD status code:
+ *   A = added, M = modified, D = deleted, R = renamed,
+ *   C = copied, T = type-change, U = unmerged.
+ *
+ * We capture the status (not just the path) because restoring an unrelated
+ * file's staged state correctly depends on which kind of change it was —
+ * a staged deletion needs `git rm --cached`, but a staged add/modify needs
+ * `git add` to put it back into the index.
+ */
+interface PriorStagedEntry {
+	path: string;
+	status: string;
+}
+
+/**
+ * Read the set of files currently staged (index vs HEAD) along with each
+ * file's status code. Uses `-z` so paths with spaces, quotes, or other
+ * special characters round-trip safely instead of being shell-quoted by git.
+ *
+ * `-z` output format:
+ *   STATUS\0PATH\0
+ * For renames/copies (R/C), git emits two paths, source then destination:
+ *   R100\0SRC\0DST\0
+ * We treat the destination as the canonical "currently staged" path because
+ * that's what shows up in subsequent index queries.
+ */
+function getPriorStagedEntries(): PriorStagedEntry[] {
+	const output = git('diff', '--cached', '--name-status', '-z');
+	if (!output) return [];
+
+	const tokens = output.split('\0').filter((t) => t.length > 0);
+	const entries: PriorStagedEntry[] = [];
+	let i = 0;
+	while (i < tokens.length) {
+		const rawStatus = tokens[i++];
+		if (!rawStatus) continue;
+		const status = rawStatus[0] ?? '';
+		if (status === 'R' || status === 'C') {
+			// Skip the source path; use the destination as the staged path.
+			i++;
+			const dst = tokens[i++];
+			if (dst) entries.push({ path: dst, status });
+		} else {
+			const path = tokens[i++];
+			if (path) entries.push({ path, status });
+		}
+	}
+	return entries;
+}
+
+/**
+ * Files that have unstaged working-tree changes vs the index. Used to detect
+ * the partial-hunk staging case where a single file appears in BOTH
+ * `--cached` and worktree diffs (e.g. `git add -p` selected some hunks but
+ * not others). Our isolation strategy can't preserve that selection, so we
+ * refuse to operate when this would silently destroy the user's choices.
+ */
+function getWorkingTreeModifiedFiles(): Set<string> {
+	const output = git('diff', '--name-only', '-z');
+	if (!output) return new Set();
+	return new Set(output.split('\0').filter((t) => t.length > 0));
+}
+
+/**
+ * Detects unrelated staged files that ALSO have unstaged working-tree
+ * changes. If we proceeded, our restore step would `git add <file>` which
+ * folds the unstaged hunks into the index, silently destroying the user's
+ * partial-hunk selection from `git add -p`. Caller should bail with a clear
+ * error in this case.
+ */
+function findPartiallyStagedUnrelated({
+	unrelated,
+}: {
+	unrelated: PriorStagedEntry[];
+}): string[] {
+	if (unrelated.length === 0) return [];
+	const workingTreeModified = getWorkingTreeModifiedFiles();
+	return unrelated
+		.filter((e) => workingTreeModified.has(e.path))
+		.map((e) => e.path);
+}
+
+/**
+ * Move unrelated staged entries out of the index so the upcoming
+ * `git commit` only writes the files passed via `-f`. Working-tree contents
+ * are untouched — only the index is changed. The reverse operation is
+ * `restoreUnrelatedStaging` which we run from `finally` (and from the
+ * signal handler) so the user's prior staging state is recovered no matter
+ * how this command terminates.
+ *
+ * Two index operations are needed because git treats them differently:
+ *   - Newly added files (status 'A') are not in HEAD, so `git reset HEAD`
+ *     would fail or leave a phantom entry. Use `git rm --cached` instead.
+ *   - Everything else (M/D/R/C/T) is in HEAD; `git reset HEAD` puts the
+ *     index entry back to its HEAD state, leaving the working tree alone.
+ */
+function temporarilyUnstageUnrelated({
+	unrelated,
+}: {
+	unrelated: PriorStagedEntry[];
+}): void {
+	if (unrelated.length === 0) return;
+
+	const newlyAdded = unrelated
+		.filter((e) => e.status === 'A')
+		.map((e) => e.path);
+	const tracked = unrelated
+		.filter((e) => e.status !== 'A')
+		.map((e) => e.path);
+
+	if (tracked.length) {
+		execFileSync(
+			'git',
+			['reset', 'HEAD', '--', ...toLiteralPathspecs({ paths: tracked })],
+			{ stdio: 'pipe', env: GIT_ENV },
+		);
+	}
+	if (newlyAdded.length) {
+		execFileSync(
+			'git',
+			[
+				'rm',
+				'--cached',
+				'--',
+				...toLiteralPathspecs({ paths: newlyAdded }),
+			],
+			{ stdio: 'pipe', env: GIT_ENV },
+		);
+	}
+}
+
+/**
+ * Re-apply the prior staging state captured by `getPriorStagedEntries`.
+ * Best-effort per file — if one entry can't be restored (e.g. another
+ * process raced us and removed the file from disk), we log and continue
+ * so we still recover as much of the user's staging as possible.
+ *
+ * Status mapping:
+ *   - D (staged deletion): `git rm --cached` re-stages the deletion. This
+ *     handles both the "file deleted from disk + indexed" and the
+ *     `git rm --cached` (file kept on disk, removed from index) cases —
+ *     either way, the staged state we want is "absent from index".
+ *   - A/M/R/C/T: `git add` re-stages the current working-tree contents.
+ *     We deliberately do NOT capture and restore the original blob, so
+ *     this loses partial-hunk selections (which is why the commit action
+ *     refuses to proceed when those are detected — see
+ *     `findPartiallyStagedUnrelated`).
+ */
+function restoreUnrelatedStaging({
+	unrelated,
+}: {
+	unrelated: PriorStagedEntry[];
+}): void {
+	if (unrelated.length === 0) return;
+
+	const failures: string[] = [];
+	for (const entry of unrelated) {
+		try {
+			if (entry.status === 'D') {
+				execFileSync(
+					'git',
+					[
+						'rm',
+						'--cached',
+						'--',
+						toLiteralPathspec({ relativePath: entry.path }),
+					],
+					{ stdio: 'pipe', env: GIT_ENV },
+				);
+			} else {
+				execFileSync(
+					'git',
+					[
+						'add',
+						'--',
+						toLiteralPathspec({ relativePath: entry.path }),
+					],
+					{ stdio: 'pipe', env: GIT_ENV },
+				);
+			}
+		} catch {
+			failures.push(entry.path);
+		}
+	}
+
+	if (failures.length > 0) {
+		logError(
+			`Failed to restore prior staging for ${failures.length} file(s): ${failures.join(', ')}. You may need to re-stage them manually.`,
+		);
+	}
 }
 
 /** Returns the set of files git considers tracked (exist in HEAD) */
@@ -456,32 +644,63 @@ function verifyOwnership(owner: string): LockInfo {
 const CLEANUP_SIGNALS: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 
 /**
- * Install signal handlers that release our lock before the process dies.
- * Without this, Ctrl+C during a long pre-commit hook would kill the Bun
- * process via Node's default SIGINT handler (exit 130) *before* the
- * try/finally around the commit can release the lock — leaving a stale
- * lock directory behind.
+ * Install signal handlers that clean up before the process dies. Without
+ * this, Ctrl+C during a long pre-commit hook would kill the Bun process via
+ * Node's default SIGINT handler (exit 130) *before* the try/finally around
+ * the commit can run — leaving a stale lock directory and (with the
+ * isolation logic) prior-staged files temporarily unstaged.
  *
- * Only the caller that acquired the lock should install these; multi-turn
- * callers (external lock) must not clear someone else's lock.
+ * Two cleanup tasks run on signal:
+ *
+ *   1. Restore unrelated prior-staged files (read live from
+ *      `getUnrelatedToRestore` so the handler sees whatever's been captured
+ *      so far — even if the signal arrives mid-isolation).
+ *   2. Release the lock if `releaseLockOnSignal` is true. Multi-turn
+ *      callers hold the lock externally and must not have it cleared by
+ *      our interrupt, so the commit action passes false in that case.
+ *
+ * Restore happens BEFORE lock release so the lock still guarantees no race
+ * with another agent while we're putting the index back. Ownership of the
+ * lock is verified inside the handler so nothing gets cleared if something
+ * else already broke or stole it during the hook run.
  *
  * Returns a disposer that removes the handlers when normal cleanup runs.
  */
-function installLockCleanupHandlers({ owner }: { owner: string }): () => void {
+function installLockCleanupHandlers({
+	owner,
+	releaseLockOnSignal,
+	getUnrelatedToRestore,
+}: {
+	owner: string;
+	releaseLockOnSignal: boolean;
+	getUnrelatedToRestore?: () => PriorStagedEntry[];
+}): () => void {
 	const handler = (signal: NodeJS.Signals) => {
+		const messages: string[] = [];
 		try {
-			// Only release if we still own the lock — defensive in case
-			// something else already broke/stole it during the hook run.
-			const info = readLock();
-			if (info && info.owner === owner) {
-				releaseLock();
-				logError(`Interrupted by ${signal} — lock released.`);
-			} else {
-				logError(`Interrupted by ${signal}.`);
+			const unrelated = getUnrelatedToRestore?.() ?? [];
+			if (unrelated.length > 0) {
+				try {
+					restoreUnrelatedStaging({ unrelated });
+					messages.push(
+						`restored ${unrelated.length} prior-staged file(s)`,
+					);
+				} catch {
+					// Best effort — we're terminating anyway.
+				}
+			}
+			if (releaseLockOnSignal) {
+				const info = readLock();
+				if (info && info.owner === owner) {
+					releaseLock();
+					messages.push('lock released');
+				}
 			}
 		} catch {
 			// Swallow — we're already terminating; don't mask the signal exit.
 		}
+		const summary = messages.length > 0 ? ` — ${messages.join(', ')}.` : '.';
+		logError(`Interrupted by ${signal}${summary}`);
 		// Conventional exit code for signal-terminated processes.
 		const signalNumbers: Record<string, number> = {
 			SIGINT: 2,
@@ -555,24 +774,89 @@ program
 			log('Lock acquired.');
 		}
 
+		// Tracks unrelated files we temporarily unstaged so we can restore
+		// their staging in `finally` (and from the signal handler if the
+		// user hits Ctrl+C). Declared here so the signal handler closure
+		// reads the live value at signal time, not at registration time.
+		let unrelatedToRestore: PriorStagedEntry[] = [];
+
 		// Register signal handlers so Ctrl+C (e.g. during a slow pre-commit
-		// hook) releases the lock before the process dies. Only install when
-		// we acquired the lock — a caller holding a multi-turn lock should
-		// not have their lock cleared by our interrupt.
-		const uninstallSignalHandlers = weAcquired
-			? installLockCleanupHandlers({ owner })
-			: () => {};
+		// hook) cleans up before the process dies. Lock release on signal
+		// is gated on whether we acquired the lock — a multi-turn caller
+		// holding an external lock must not have it cleared by our interrupt
+		// — but staging restore runs in either case so the user's prior
+		// staged work is never silently lost.
+		const uninstallSignalHandlers = installLockCleanupHandlers({
+			owner,
+			releaseLockOnSignal: weAcquired,
+			getUnrelatedToRestore: () => unrelatedToRestore,
+		});
 
 		// Everything after lock acquisition is wrapped in try/finally
-		// so the lock is always released (if we acquired it) on any failure.
+		// so the lock is always released (if we acquired it) and
+		// any temporarily-unstaged files are restored on any failure.
 		let commitFailed = false;
 		let failingPhase: 'staging' | 'commit' = 'staging';
 		try {
-			const priorStaged = getStagedFiles();
-			if (priorStaged.length > 0) {
+			// Capture the full prior staging state (path + status code), then
+			// split into "overlap" (also passed via -f, will be committed) and
+			// "unrelated" (must be isolated out so they don't get bundled
+			// into our commit). The overlap set is what the old rollback
+			// logic used to call `priorStaged`.
+			const priorStagedEntries = getPriorStagedEntries();
+			const requestedSet = new Set<string>(files);
+			const overlap = priorStagedEntries.filter((e) =>
+				requestedSet.has(e.path),
+			);
+			const unrelated = priorStagedEntries.filter(
+				(e) => !requestedSet.has(e.path),
+			);
+			const overlapPaths = new Set(overlap.map((e) => e.path));
+
+			if (priorStagedEntries.length > 0) {
+				const parts: string[] = [];
+				if (unrelated.length > 0) {
+					parts.push(
+						`${unrelated.length} unrelated (will be temp-unstaged and restored after commit)`,
+					);
+				}
+				if (overlap.length > 0) {
+					parts.push(`${overlap.length} also in --files`);
+				}
 				log(
-					`Note: ${priorStaged.length} file(s) already staged: ${priorStaged.join(', ')}`,
+					`Note: ${priorStagedEntries.length} file(s) already staged: ${parts.join(', ')}`,
 				);
+			}
+
+			// Refuse to operate when an unrelated staged file ALSO has
+			// unstaged working-tree changes (typical of `git add -p` partial
+			// hunks). Our restore re-stages with `git add <file>`, which
+			// would silently fold the unstaged hunks into the index — the
+			// opposite of "atomic". Bail out with a clear, actionable error
+			// so the user can commit/stash the partial-hunk selection first.
+			if (unrelated.length > 0) {
+				const partial = findPartiallyStagedUnrelated({ unrelated });
+				if (partial.length > 0) {
+					throw new Error(
+						`Cannot atomically commit: ${partial.length} unrelated staged file(s) ` +
+							`also have unstaged working-tree changes (likely partial-hunk staging via ` +
+							`\`git add -p\`): ${partial.join(', ')}. ` +
+							`Atomic-commit isolates unrelated staging by temp-unstaging and re-staging, ` +
+							`which would lose your partial-hunk selection. ` +
+							`Please \`git commit\` or \`git stash\` those changes first, then retry.`,
+					);
+				}
+			}
+
+			if (unrelated.length > 0) {
+				log(
+					`Temporarily unstaging ${unrelated.length} unrelated file(s) to isolate the atomic commit: ${unrelated.map((e) => e.path).join(', ')}`,
+				);
+				// Mark for restore BEFORE attempting so even partial failures
+				// (e.g. tracked reset succeeded but `rm --cached` of newly-
+				// added files threw) get a best-effort restore from finally.
+				unrelatedToRestore = unrelated;
+				temporarilyUnstageUnrelated({ unrelated });
 			}
 
 			const trackedFiles = getTrackedFiles(files);
@@ -607,14 +891,36 @@ program
 				}
 				logError(`Atomic operation failed during ${failingPhase} — rolling back staging...`);
 
+				// Don't unstage overlap files — those were already staged by
+				// someone else before this command ran, so leaving them
+				// staged matches the contract that "this command never
+				// touches another agent's prior staging".
 				const toUnstage = files.filter(
-					(f: string) => !priorStaged.includes(f),
+					(f: string) => !overlapPaths.has(f),
 				);
 				unstageFiles(toUnstage, trackedFiles);
 				log(`Rolled back ${toUnstage.length} file(s).`);
 				commitFailed = true;
 			}
 		} finally {
+			// Restore unrelated staging BEFORE releasing the lock so the
+			// lock still guarantees no race with another agent while we're
+			// putting the index back. Clear the tracker afterward so the
+			// signal handler (still registered until uninstall below)
+			// doesn't double-restore if a signal arrives during cleanup.
+			if (unrelatedToRestore.length > 0) {
+				log(
+					`Restoring ${unrelatedToRestore.length} previously-staged file(s): ${unrelatedToRestore.map((e) => e.path).join(', ')}`,
+				);
+				try {
+					restoreUnrelatedStaging({ unrelated: unrelatedToRestore });
+				} catch (err: any) {
+					logError(
+						`Failed to restore prior staged files: ${err?.message ?? String(err)}`,
+					);
+				}
+				unrelatedToRestore = [];
+			}
 			if (weAcquired) {
 				releaseLock();
 				log('Lock released.');

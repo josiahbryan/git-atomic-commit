@@ -124,6 +124,22 @@ Stale locks are also automatically detected and stolen — a lock is considered 
 - Its TTL has expired, OR
 - The owning PID is dead and the lock is older than 10 seconds
 
+### Isolation from unrelated staged files
+
+`git commit` commits the entire index — not just the paths on the command line. So if another agent has unrelated files staged when you run `git-atomic-commit commit -f a.ts b.ts`, those files would silently get bundled into your commit.
+
+To honor the atomic contract ("commit ONLY the files in `--files`"), the tool:
+
+1. Snapshots the current index (path + status code) before staging.
+2. Splits prior-staged files into two groups: **overlap** (also passed via `--files`, will be committed normally) and **unrelated** (everything else).
+3. Temporarily removes unrelated entries from the index using the right command for their status — `git rm --cached` for newly added files (status `A`), `git reset HEAD --` for everything else.
+4. Stages and commits the `--files` paths.
+5. Restores the unrelated staging (`git add` for `A`/`M`/`R`/`C`/`T`, `git rm --cached` for `D`).
+
+Restoration runs even if the commit fails or the user hits Ctrl+C during a slow pre-commit hook, so prior staged work is never silently lost. The lock is held until restoration finishes, so no other agent can race the index during recovery.
+
+**One refusal case:** if an unrelated staged file ALSO has unstaged working-tree changes (typical of `git add -p` partial hunks), the command exits with a clear error before touching the index. Re-staging with `git add` would silently fold the unstaged hunks into the index — the opposite of "atomic". Commit or stash that file first, then retry.
+
 ## How It Works
 
 ### Lock mechanism
@@ -148,6 +164,8 @@ When a commit fails, the tool needs to unstage files it added without disturbing
 3. On failure: unstaging only its own files using the correct git command:
    - Tracked files: `git reset HEAD -- <file>`
    - New files: `git rm --cached <file>`
+
+Files that were temporarily moved out of the index for isolation (see [Isolation from unrelated staged files](#isolation-from-unrelated-staged-files) above) are restored in the same `finally` block so the index ends up exactly as the user left it before the failed commit.
 
 ### Per-repo isolation
 

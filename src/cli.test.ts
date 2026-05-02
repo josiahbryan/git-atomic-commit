@@ -62,6 +62,27 @@ function stagedFiles(): string[] {
 	return output ? output.split('\n').filter(Boolean) : [];
 }
 
+/** Get staged files with their index-vs-HEAD status code (e.g. A, M, D) */
+function stagedEntries(): Array<{ path: string; status: string }> {
+	const output = gitCmd('diff', '--cached', '--name-status');
+	if (!output) return [];
+	return output
+		.split('\n')
+		.filter(Boolean)
+		.map((line) => {
+			const parts = line.split('\t');
+			const status = (parts[0] ?? '')[0] ?? '';
+			const path = parts[parts.length - 1] ?? '';
+			return { path, status };
+		});
+}
+
+/** Names of files in the most recent commit (HEAD vs HEAD~1) */
+function filesInHead(): string[] {
+	const output = gitCmd('diff', '--name-only', 'HEAD~1', 'HEAD');
+	return output ? output.split('\n').filter(Boolean) : [];
+}
+
 /** Get the lock dir path */
 function lockDir(): string {
 	return join(tmpRepo, '.git', 'atomic-commit.lock');
@@ -197,6 +218,200 @@ describe('git-atomic-commit', () => {
 			const staged = stagedFiles();
 			expect(staged).toContain('theirs.txt');
 			expect(staged).not.toContain('ours.txt');
+		});
+
+		/**
+		 * Core atomic-isolation contract: when another agent has unrelated
+		 * files staged at the moment we run, the resulting commit must
+		 * contain ONLY the files passed via --files. The previously-staged
+		 * files are temp-unstaged for the duration of the commit and then
+		 * restored to the index afterward.
+		 *
+		 * Regression test for the "8 unrelated files got bundled into my
+		 * refactor commit" bug.
+		 */
+		test('isolates unrelated staged files from the atomic commit', () => {
+			// Existing tracked file modified-and-staged by another agent.
+			createFile('tracked.txt', 'v1\n');
+			gitCmd('add', 'tracked.txt');
+			gitCmd('commit', '-m', 'add tracked', '--no-verify');
+			createFile('tracked.txt', 'v2 from other agent\n');
+			gitCmd('add', 'tracked.txt');
+
+			// Brand-new file staged by another agent.
+			createFile('new-from-other.txt', 'newly added by other agent\n');
+			gitCmd('add', 'new-from-other.txt');
+
+			// Files we actually want to commit atomically.
+			createFile('ours-a.txt', 'ours a\n');
+			createFile('ours-b.txt', 'ours b\n');
+
+			// Sanity: all three unrelated files are staged before our commit runs.
+			expect(stagedFiles().sort()).toEqual([
+				'new-from-other.txt',
+				'tracked.txt',
+			]);
+
+			const result = gac(
+				'commit -f ours-a.txt ours-b.txt -m "test: only ours" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Commit successful');
+			expect(result.stdout).toContain('Temporarily unstaging');
+			expect(result.stdout).toContain('Restoring');
+
+			// The HEAD commit must contain ONLY our files.
+			const committed = filesInHead().sort();
+			expect(committed).toEqual(['ours-a.txt', 'ours-b.txt']);
+
+			// The unrelated files must be back in the index, with their
+			// original status codes preserved.
+			const after = stagedEntries().sort((a, b) =>
+				a.path.localeCompare(b.path),
+			);
+			expect(after).toEqual([
+				{ path: 'new-from-other.txt', status: 'A' },
+				{ path: 'tracked.txt', status: 'M' },
+			]);
+		});
+
+		/**
+		 * Same isolation contract, but on the failure path: even when the
+		 * commit fails (empty message), the unrelated staged files must be
+		 * restored exactly as they were. Otherwise a hook rejection would
+		 * silently destroy another agent's staged work.
+		 */
+		test('restores unrelated staged files after commit failure', () => {
+			createFile('theirs-modified.txt', 'v1\n');
+			gitCmd('add', 'theirs-modified.txt');
+			gitCmd('commit', '-m', 'add their file', '--no-verify');
+			createFile('theirs-modified.txt', 'v2\n');
+			gitCmd('add', 'theirs-modified.txt');
+
+			createFile('theirs-new.txt', 'theirs new\n');
+			gitCmd('add', 'theirs-new.txt');
+
+			createFile('ours.txt', 'ours\n');
+
+			const before = stagedEntries().sort((a, b) =>
+				a.path.localeCompare(b.path),
+			);
+
+			// Empty message -> commit fails.
+			const result = gac('commit -f ours.txt -m "" --no-verify');
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain(
+				'Atomic operation failed during commit',
+			);
+
+			// The unrelated files must be back exactly as they were before.
+			const after = stagedEntries().sort((a, b) =>
+				a.path.localeCompare(b.path),
+			);
+			expect(after).toEqual(before);
+			// And ours.txt was rolled back from its temporary staging.
+			expect(stagedFiles()).not.toContain('ours.txt');
+		});
+
+		/**
+		 * Staged deletions (status D) — whether from `git rm` or
+		 * `git rm --cached` — are a different beast. A naive "git add to
+		 * restore" would silently re-add the file to the index, undoing the
+		 * other agent's staged removal. This test pins the behavior that
+		 * staged D entries survive the atomic commit untouched.
+		 */
+		test('preserves an unrelated staged deletion across atomic commit', () => {
+			// Set up a staged `git rm --cached` (D status, file still on disk).
+			createFile('removed-from-index.txt', 'still on disk\n');
+			gitCmd('add', 'removed-from-index.txt');
+			gitCmd('commit', '-m', 'add file', '--no-verify');
+			gitCmd('rm', '--cached', 'removed-from-index.txt');
+
+			// Sanity: D status, file still present on disk.
+			expect(stagedEntries()).toEqual([
+				{ path: 'removed-from-index.txt', status: 'D' },
+			]);
+			expect(existsSync(join(tmpRepo, 'removed-from-index.txt'))).toBe(true);
+
+			createFile('ours.txt', 'ours\n');
+
+			const result = gac(
+				'commit -f ours.txt -m "test: isolation preserves staged D" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+
+			// HEAD must NOT include the staged deletion.
+			expect(filesInHead()).toEqual(['ours.txt']);
+			// The staged deletion must still be staged with status D.
+			expect(stagedEntries()).toEqual([
+				{ path: 'removed-from-index.txt', status: 'D' },
+			]);
+			// And the file is still on disk (we only ever touched the index).
+			expect(existsSync(join(tmpRepo, 'removed-from-index.txt'))).toBe(true);
+		});
+
+		/**
+		 * The overlap case: a file is both already staged AND passed via
+		 * --files. We must commit it (not "isolate" it), and the post-commit
+		 * state should be a single committed entry — no duplicate staging.
+		 */
+		test('overlap: a file already staged AND in --files is committed normally', () => {
+			createFile('shared.txt', 'v1\n');
+			gitCmd('add', 'shared.txt');
+
+			// Same file passed via --files — should be committed once.
+			const result = gac(
+				'commit -f shared.txt -m "test: overlap commits once" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Commit successful');
+			// "Note: 1 file(s) already staged" with overlap labeling.
+			expect(result.stdout).toContain('also in --files');
+
+			expect(filesInHead()).toEqual(['shared.txt']);
+			expect(stagedFiles()).toEqual([]);
+		});
+
+		/**
+		 * Partial-hunk staging via `git add -p` produces a file that
+		 * appears in BOTH `--cached` and worktree diffs. Our restore step
+		 * uses `git add <file>`, which would silently fold the unstaged
+		 * hunks into the index — destroying the user's hunk selection.
+		 * Bail out with a clear error before any index changes happen.
+		 */
+		test('refuses to commit when an unrelated file has both staged and unstaged changes (partial hunks)', () => {
+			createFile('base.txt', 'v1\n');
+			gitCmd('add', 'base.txt');
+			gitCmd('commit', '-m', 'add base', '--no-verify');
+
+			// Stage v2, then continue editing to v3 in the working tree.
+			// `git diff --cached` shows base.txt; `git diff` ALSO shows it.
+			createFile('base.txt', 'v2\n');
+			gitCmd('add', 'base.txt');
+			createFile('base.txt', 'v3\n');
+
+			const beforeStaged = stagedEntries();
+			const beforeContent = readFileSync(join(tmpRepo, 'base.txt'), 'utf-8');
+
+			createFile('ours.txt', 'ours\n');
+
+			const result = gac(
+				'commit -f ours.txt -m "test: refuse partial hunks" --no-verify',
+			);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain(
+				'partial-hunk staging',
+			);
+			expect(result.stdout + result.stderr).toContain('base.txt');
+
+			// Index and working tree must be untouched — refusal must come
+			// BEFORE we temp-unstage anything.
+			expect(stagedEntries()).toEqual(beforeStaged);
+			expect(readFileSync(join(tmpRepo, 'base.txt'), 'utf-8')).toBe(
+				beforeContent,
+			);
+			expect(stagedFiles()).not.toContain('ours.txt');
+			expect(lockExists()).toBe(false);
 		});
 
 		test('handles mix of tracked and untracked files in rollback', () => {
@@ -441,6 +656,53 @@ describe('git-atomic-commit', () => {
 
 			expect(lockExists()).toBe(false);
 			expect(stagedFiles()).toEqual([]);
+		}, 15000);
+
+		/**
+		 * Ctrl+C during a slow pre-commit hook must ALSO restore unrelated
+		 * staged files, otherwise an interrupt during a long hook would
+		 * silently lose another agent's staged work. Mirrors the lock-
+		 * cleanup test above, but seeds an unrelated staged file first
+		 * and asserts it survives the signal.
+		 */
+		test('Ctrl+C during pre-commit hook restores unrelated staging', async () => {
+			// Pre-stage an unrelated file (newly added, status A).
+			createFile('unrelated.txt', 'unrelated content\n');
+			gitCmd('add', 'unrelated.txt');
+			expect(stagedEntries()).toEqual([
+				{ path: 'unrelated.txt', status: 'A' },
+			]);
+
+			createFile('a.txt');
+
+			const hookPath = join(tmpRepo, '.git', 'hooks', 'pre-commit');
+			writeFileSync(hookPath, '#!/bin/sh\nsleep 30\n');
+			chmodSync(hookPath, 0o755);
+
+			const child = spawn(
+				'bun',
+				[CLI, 'commit', '-f', 'a.txt', '-m', 'test: sigint restores staging'],
+				{ cwd: tmpRepo, detached: true, stdio: 'pipe', env: GIT_TEST_ENV },
+			);
+
+			// Wait for lock acquisition + temp-unstage + entry into the
+			// sleeping hook before signaling.
+			await new Promise((r) => setTimeout(r, 2500));
+			expect(lockExists()).toBe(true);
+
+			process.kill(-child.pid!, 'SIGINT');
+
+			await new Promise<void>((resolve) => {
+				child.on('exit', () => resolve());
+			});
+
+			// Lock cleaned up, our file rolled back, and the unrelated
+			// file's prior staged state restored exactly as it was.
+			expect(lockExists()).toBe(false);
+			expect(stagedFiles()).not.toContain('a.txt');
+			expect(stagedEntries()).toEqual([
+				{ path: 'unrelated.txt', status: 'A' },
+			]);
 		}, 15000);
 	});
 

@@ -36,6 +36,10 @@ bun src/cli.ts <cmd>  # Run CLI locally without building
 
 On commit failure, only files that were NOT already staged before the operation are unstaged. Tracked vs untracked files use different unstage strategies (`git reset HEAD` vs `git rm --cached`). The lock is always released via `try/finally` if this invocation acquired it (externally-held locks are preserved).
 
+### Isolation from unrelated prior staging
+
+`git commit` writes the entire index, not just the `--files` paths, so before staging the tool snapshots the prior staged entries (path + status), temporarily removes anything that's not in `--files` from the index, runs the commit, and restores those entries afterward. Restore runs from `finally` and from the Ctrl+C signal handler. The CLI refuses to proceed if an unrelated staged file also has unstaged working-tree changes (partial-hunk staging via `git add -p`) because re-staging via `git add` would silently fold the unstaged hunks into the index.
+
 ### Two usage modes
 
 1. **One-shot** (`commit`): acquires lock, stages, commits, releases lock. Auto-rollback on failure.

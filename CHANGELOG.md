@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-05-02
+
+### Fixed
+
+- `commit` now actually commits **only** the files passed via `--files`. Previously the tool only inspected which files were already staged and used that for rollback — but the underlying `git commit` writes the entire index, so any unrelated files an agent had staged were silently bundled into the commit (e.g. eight unrelated paths from another agent ending up in a "refactor" commit). The fix captures each prior-staged path's index-vs-HEAD status, temporarily removes unrelated entries from the index for the duration of the commit (`git rm --cached` for `A`, `git reset HEAD --` for everything else), and restores them afterward (`git add` for `A`/`M`/`R`/`C`/`T`, `git rm --cached` for `D`). Restore runs from `finally` and from the Ctrl+C signal handler, so prior staged work is never silently lost on failure or interrupt. The lock is held until restoration completes, so no other agent can race the index during recovery.
+- The Ctrl+C cleanup handler now restores temporarily-unstaged files in addition to releasing the lock, including in multi-turn mode (where the lock is held externally and is *not* released by the handler, but staging restore still runs).
+
+### Changed
+
+- The `commit` action refuses to operate when an unrelated staged file ALSO has unstaged working-tree changes (typical of `git add -p` partial-hunk staging). Re-staging via `git add <file>` would silently fold the unstaged hunks into the index — the opposite of "atomic" — so the command exits with a clear, actionable error before touching the index, telling the user to commit or stash the partial-hunk selection first.
+- The "already staged" log line now distinguishes between **unrelated** (will be temp-unstaged and restored) and **also in --files** (overlap; will be committed) so it's obvious what the tool is about to do with each.
+
+### Tests
+
+- Cover isolation success path, restore-on-commit-failure, staged deletion preservation across atomic commit, overlap (file is both in priorStaged and in `--files`), partial-hunk refusal, and Ctrl+C-during-hook restoring unrelated staging.
+
 ## [1.3.3] - 2026-04-24
 
 ### Fixed
