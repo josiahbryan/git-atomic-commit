@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/install.sh` and `scripts/install-remote.sh` now ad-hoc codesign the binary on macOS after copy/move (`codesign --force --sign -`). Without this, macOS Gatekeeper SIGKILLs the binary on first launch with no output (exit code 137) because `cp` to `/usr/local/bin/` inherits the `com.apple.provenance` xattr (which can't be removed even with sudo), and `curl` adds `com.apple.quarantine`. Ad-hoc signing stamps a stable cdhash that bypasses the kill — the same trick Homebrew uses for unsigned bottles. Also tightened the verification warning to point macOS users at `codesign --force --sign -` instead of the misleading "Check that $INSTALL_DIR is in your PATH" message that fired regardless of the actual failure mode.
+
 ## [1.4.0] - 2026-05-02
 
 ### Fixed

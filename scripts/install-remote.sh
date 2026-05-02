@@ -68,10 +68,30 @@ fi
 if [ -w "$INSTALL_DIR" ]; then
   mv "$TMPFILE" "$INSTALL_PATH"
   chmod 755 "$INSTALL_PATH"
+  SUDO=""
 else
   echo "[install] $INSTALL_DIR not writable, using sudo..."
   sudo mv "$TMPFILE" "$INSTALL_PATH"
   sudo chmod 755 "$INSTALL_PATH"
+  SUDO="sudo"
+fi
+
+# macOS Gatekeeper SIGKILLs unsigned binaries on first launch (the symptom
+# is exit code 137 with no output). Files downloaded by curl carry
+# `com.apple.quarantine`, and a move into a system path also inherits
+# `com.apple.provenance` — both can trigger the kill. Ad-hoc re-signing
+# stamps a stable cdhash that bypasses the check; this is what `brew`
+# does for unsigned bottles. Best-effort: if codesign isn't available or
+# fails, warn but keep going so the verification step can still surface
+# a useful error.
+if [ "$(uname -s)" = "Darwin" ]; then
+  if command -v codesign >/dev/null 2>&1; then
+    if $SUDO codesign --force --sign - "$INSTALL_PATH" >/dev/null 2>&1; then
+      echo "[install] Ad-hoc codesigned for macOS Gatekeeper."
+    else
+      echo "[install] Warning: ad-hoc codesign failed; binary may be killed by Gatekeeper on launch."
+    fi
+  fi
 fi
 
 echo "[install] Installed git-atomic-commit to $INSTALL_PATH"
@@ -82,5 +102,11 @@ if [ -n "$VERSION" ]; then
   echo "[install] Version: $VERSION"
   echo "[install] Done! Run 'git-atomic-commit --help' to get started."
 else
-  echo "[install] Warning: verification failed. Check that $INSTALL_DIR is in your PATH."
+  echo "[install] Warning: $INSTALL_PATH did not run cleanly."
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "[install]   On macOS this is usually a Gatekeeper signing issue. Try:"
+    echo "[install]     sudo codesign --force --sign - $INSTALL_PATH"
+  else
+    echo "[install]   Check that $INSTALL_DIR is in your PATH."
+  fi
 fi
