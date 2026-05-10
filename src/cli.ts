@@ -10,6 +10,10 @@ import {
 	rmSync,
 	existsSync,
 	lstatSync,
+	openSync,
+	closeSync,
+	statSync,
+	constants as fsConstants,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 
@@ -153,6 +157,144 @@ function getGitDir(): string {
 
 function getLockDir(): string {
 	return join(resolve(getGitDir()), LOCK_DIR_NAME);
+}
+
+// ── Critical-section mutex (process-bound, for index-mutating phase) ─
+
+/**
+ * Sentinel file used to serialize the index-mutating critical section
+ * (snapshot → temp-unstage → commit → restore) across concurrent
+ * atomic-commit invocations. Distinct from the outer file-based TTL/PID
+ * lock used by `lock`/`commit` because that one is OWNER-bound — a multi-
+ * step caller intentionally shares an owner across many `commit` calls,
+ * and same-owner invocations BYPASS the outer lock acquisition. That
+ * bypass plus a parallel multi-step caller using the same owner can let
+ * two processes interleave their `temporarilyUnstage` windows, which is
+ * exactly how the staged-D corruption reproduces.
+ *
+ * This second lock is process-bound and unconditional: every commit
+ * critical section acquires it, regardless of owner. Implementation is
+ * an O_EXCL atomic file create; staleness is bounded by a 2-minute
+ * mtime threshold so a crashed predecessor can't block forever.
+ */
+const CS_LOCK_FILENAME = 'atomic-commit.cs-lock';
+// Defaults are tuned for production. Tests override via the GAC_CS_*
+// env vars below to exercise contention and staleness in milliseconds
+// instead of minutes; they are not part of the public API.
+const CS_LOCK_STALE_MS = parseInt(
+	process.env['GAC_CS_STALE_MS'] ?? '',
+	10,
+) || 120_000; // 2 minutes
+const CS_LOCK_WAIT_MS = parseInt(
+	process.env['GAC_CS_WAIT_MS'] ?? '',
+	10,
+) || 60_000;
+const CS_LOCK_POLL_MIN_MS = parseInt(
+	process.env['GAC_CS_POLL_MIN_MS'] ?? '',
+	10,
+) || 50;
+const CS_LOCK_POLL_MAX_MS = parseInt(
+	process.env['GAC_CS_POLL_MAX_MS'] ?? '',
+	10,
+) || 250;
+
+let csLockHeld = false;
+// Tracks whether the most recent enterCriticalSection() call had to wait
+// for another process (saw EEXIST at least once). When true, a concurrent
+// invocation was observed in this commit's window, and the snapshot we
+// took may be contaminated by the other process's transient unstage —
+// only THEN does the phantom-D auto-correct in restoreUnrelatedStaging
+// fire. When false (no contention), we trust the snapshot and preserve
+// any staged-D entries verbatim, matching the documented contract that
+// atomic-commit never touches another agent's intentional prior staging.
+let csLockContended = false;
+
+function getCsLockPath(): string {
+	return join(resolve(getGitDir()), CS_LOCK_FILENAME);
+}
+
+/**
+ * Synchronous sleep used for spin-waits. Uses Atomics.wait on a private
+ * SharedArrayBuffer so we don't busy-loop the CPU while polling.
+ */
+function csSleepSync(ms: number): void {
+	const sab = new SharedArrayBuffer(4);
+	const view = new Int32Array(sab);
+	Atomics.wait(view, 0, 0, ms);
+}
+
+function csJitter(): number {
+	return (
+		CS_LOCK_POLL_MIN_MS +
+		Math.floor(Math.random() * (CS_LOCK_POLL_MAX_MS - CS_LOCK_POLL_MIN_MS))
+	);
+}
+
+/**
+ * Enter the index-mutating critical section. Spins on O_EXCL until it
+ * either creates the sentinel file or times out (CS_LOCK_WAIT_MS). If
+ * the existing sentinel is older than CS_LOCK_STALE_MS it's assumed
+ * orphaned (predecessor crashed without releasing) and removed.
+ */
+function enterCriticalSection(): void {
+	if (csLockHeld) return;
+	csLockContended = false;
+	const path = getCsLockPath();
+	const start = Date.now();
+	while (true) {
+		try {
+			const fd = openSync(
+				path,
+				fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY,
+				0o644,
+			);
+			try {
+				writeFileSync(fd, `${process.pid}\n${Date.now()}\n`);
+			} finally {
+				closeSync(fd);
+			}
+			csLockHeld = true;
+			return;
+		} catch (err: any) {
+			if (err?.code !== 'EEXIST') throw err;
+			// Contention observed — a concurrent atomic-commit invocation
+			// was inside its critical section when we tried to enter. Mark
+			// so restoreUnrelatedStaging knows the snapshot it took may
+			// have caught a transient unstage from that other process.
+			csLockContended = true;
+			// Staleness check — sentinel from a crashed predecessor.
+			try {
+				const st = statSync(path);
+				const age = Date.now() - st.mtimeMs;
+				if (age > CS_LOCK_STALE_MS) {
+					rmSync(path, { force: true });
+					continue;
+				}
+			} catch {
+				// Sentinel disappeared between EEXIST and stat — retry create.
+				continue;
+			}
+			if (Date.now() - start > CS_LOCK_WAIT_MS) {
+				throw new Error(
+					`atomic-commit critical-section lock contention: another ` +
+						`atomic-commit invocation has held ${path} for >${CS_LOCK_WAIT_MS / 1000}s. ` +
+						`If you believe the lock is orphaned, remove the sentinel manually.`,
+				);
+			}
+			csSleepSync(csJitter());
+		}
+	}
+}
+
+/** Release the critical-section sentinel. Idempotent; safe to call from finally. */
+function exitCriticalSection(): void {
+	if (!csLockHeld) return;
+	try {
+		rmSync(getCsLockPath(), { force: true });
+	} catch {
+		// best-effort
+	}
+	csLockHeld = false;
 }
 
 /**
@@ -312,6 +454,7 @@ function restoreUnrelatedStaging({
 	if (unrelated.length === 0) return;
 
 	const failures: string[] = [];
+	const reAppliedDeletes: string[] = [];
 	for (const entry of unrelated) {
 		try {
 			if (entry.status === 'D') {
@@ -325,6 +468,7 @@ function restoreUnrelatedStaging({
 					],
 					{ stdio: 'pipe', env: GIT_ENV },
 				);
+				reAppliedDeletes.push(entry.path);
 			} else {
 				execFileSync(
 					'git',
@@ -345,6 +489,79 @@ function restoreUnrelatedStaging({
 		logError(
 			`Failed to restore prior staging for ${failures.length} file(s): ${failures.join(', ')}. You may need to re-stage them manually.`,
 		);
+	}
+
+	// Phantom-D self-correct. ONLY runs when the critical-section lock
+	// observed contention during this commit (csLockContended === true) —
+	// i.e., another atomic-commit was already inside its own critical
+	// section when we entered, which means the snapshot we took may have
+	// caught that other process mid-`temporarilyUnstage`. Without
+	// contention, a `D` entry is presumed intentional (e.g. user ran
+	// `git rm --cached` directly) and we preserve it verbatim, matching
+	// the no-contention contract pinned by the existing
+	// "preserves an unrelated staged deletion" test.
+	if (csLockContended && reAppliedDeletes.length > 0) {
+		const corrected: string[] = [];
+		for (const path of reAppliedDeletes) {
+			if (isPhantomStagedDelete(path)) {
+				try {
+					execFileSync(
+						'git',
+						[
+							'reset',
+							'HEAD',
+							'--',
+							toLiteralPathspec({ relativePath: path }),
+						],
+						{ stdio: 'pipe', env: GIT_ENV },
+					);
+					corrected.push(path);
+				} catch {
+					// Best-effort. If the correction fails, the original
+					// staged-D persists and the user will see it in
+					// `git status`. The warning below still fires.
+				}
+			}
+		}
+		if (corrected.length > 0) {
+			logError(
+				`Auto-corrected ${corrected.length} phantom staged-deletion(s) ` +
+					`(disk content matches HEAD; the D status was a transient artifact ` +
+					`from a concurrent atomic-commit invocation): ${corrected.join(', ')}. ` +
+					`If you DID intend to delete those files, re-run \`git rm --cached <path>\`.`,
+			);
+		}
+	}
+}
+
+/**
+ * Detect a phantom staged-deletion: an index entry that says "deleted from
+ * tracking" but whose on-disk content is byte-identical to HEAD's tracked
+ * blob for the same path. Such entries are almost always artifacts of a
+ * race between concurrent atomic-commit invocations — one process's
+ * `temporarilyUnstageUnrelated` window was observed by another's snapshot,
+ * which then re-applied the D in restore. Returns true when the staged-D
+ * is suspicious enough to warrant auto-correction.
+ *
+ * Returns false (i.e. "this D is intentional, leave it alone") if any of:
+ *   - The path doesn't exist on disk (genuine deletion in progress).
+ *   - The path isn't in HEAD (can't compare; preserve user's intent).
+ *   - HEAD's blob hash differs from the on-disk hash-object value
+ *     (user modified the file and intended the staged delete).
+ *   - Any git operation throws (conservative: don't auto-correct).
+ */
+function isPhantomStagedDelete(path: string): boolean {
+	try {
+		if (!existsSync(path)) return false;
+		// `HEAD:<path>` accepts a plain path, not a pathspec magic prefix.
+		// Use the raw relative path here. Quoting-safe because we never
+		// shell-interpolate — execFileSync passes args as a list.
+		const headBlob = git('rev-parse', `HEAD:${path}`).trim();
+		if (!headBlob || headBlob.startsWith('fatal')) return false;
+		const diskBlob = git('hash-object', '--', path).trim();
+		return Boolean(headBlob) && headBlob === diskBlob;
+	} catch {
+		return false;
 	}
 }
 
@@ -510,6 +727,20 @@ function unstageFiles(files: string[], trackedFiles: Set<string>): void {
 			);
 		} catch { /* best effort */ }
 	}
+}
+
+function strictUnstageFiles(files: string[]): void {
+	if (files.length === 0) return;
+	const notStaged = files.filter((relativePath) => {
+		const stagedMatches = getLiteralStagedMatches({ relativePath });
+		return !stagedMatches.includes(relativePath);
+	});
+	if (notStaged.length > 0) {
+		throw new Error(
+			`Cannot unstage path(s) because they are not staged: ${notStaged.join(', ')}`,
+		);
+	}
+	gitCaptureAndReplay('reset', 'HEAD', '--', ...toLiteralPathspecs({ paths: files }));
 }
 
 // ── Lock Management ──────────────────────────────────────────
@@ -689,6 +920,14 @@ function installLockCleanupHandlers({
 					// Best effort — we're terminating anyway.
 				}
 			}
+			// Release the process-bound critical-section sentinel before
+			// process exit so the next waiter isn't blocked for the full
+			// CS_LOCK_STALE_MS window. Idempotent if not held.
+			try {
+				exitCriticalSection();
+			} catch {
+				// Best effort.
+			}
 			if (releaseLockOnSignal) {
 				const info = readLock();
 				if (info && info.owner === owner) {
@@ -798,6 +1037,16 @@ program
 		let commitFailed = false;
 		let failingPhase: 'staging' | 'commit' = 'staging';
 		try {
+			// Acquire the process-bound critical-section mutex BEFORE
+			// snapshotting the index. The outer file-based lock above is
+			// owner-bound and explicitly bypassed for same-owner callers
+			// (multi-step `lock`+`commit`+...+`unlock` flows), so it does
+			// NOT serialize two concurrent commits that share an owner.
+			// This second lock does — it's an O_EXCL sentinel file with
+			// no notion of ownership, just "one process at a time inside
+			// the critical section." Released in the same finally below.
+			enterCriticalSection();
+
 			// Capture the full prior staging state (path + status code), then
 			// split into "overlap" (also passed via -f, will be committed) and
 			// "unrelated" (must be isolated out so they don't get bundled
@@ -921,6 +1170,10 @@ program
 				}
 				unrelatedToRestore = [];
 			}
+			// Release the process-bound critical-section sentinel AFTER
+			// restoreUnrelatedStaging completes, so the next waiter
+			// snapshots a fully-restored index (not our transient state).
+			exitCriticalSection();
 			if (weAcquired) {
 				releaseLock();
 				log('Lock released.');
@@ -928,6 +1181,84 @@ program
 			uninstallSignalHandlers();
 		}
 		if (commitFailed) process.exit(1);
+	}));
+
+// ── stage ────────────────────────────────────────────────────
+
+program
+	.command('stage')
+	.description('Stage files while holding a multi-turn transaction lock')
+	.requiredOption('-f, --files <files...>', 'Files to stage')
+	.option(
+		'-o, --owner <owner>',
+		'Lock owner identifier',
+		`pid-${process.pid}`,
+	)
+	.option(
+		'-t, --ttl <seconds>',
+		'Lock TTL in seconds',
+		String(DEFAULT_TTL_TRANSACTION),
+	)
+	.option(
+		'-w, --wait <seconds>',
+		'Poll for the lock up to this many seconds before failing (default: 0, fail immediately)',
+		'0',
+	)
+	.action(safeAction((opts) => {
+		const { files, owner } = opts;
+		const ttl = parseTtl(opts.ttl);
+		const waitSeconds = parseWait(opts.wait);
+		validateLiteralFileInputs({ paths: files });
+
+		const existing = readLock();
+		const usingExisting = Boolean(existing && existing.owner === owner && !isStale(existing));
+
+		if (usingExisting) {
+			log(`Using existing lock (owner: "${owner}")`);
+		} else {
+			log(`Acquiring lock as "${owner}" (ttl: ${ttl}s)...`);
+			acquireLockWithWait({ owner, ttlSeconds: ttl, waitSeconds, detached: true });
+			log('Lock acquired.');
+		}
+
+		try {
+			const toStage = pathsSafeForPlainGitAdd({ paths: files });
+			const skipped = files.filter((f: string) => !toStage.includes(f));
+			if (skipped.length > 0) {
+				log(
+					`Skipping git add for ${skipped.length} path(s) (staged deletion; on-disk file would re-add to index): ${skipped.join(', ')}`,
+				);
+			}
+			log(`Staging ${toStage.length} file(s): ${toStage.join(', ') || '(none — using existing index)'}`);
+			stageFiles(toStage);
+			log(`Staged ${files.length} file(s). Lock remains held.`);
+		} catch (err) {
+			if (!usingExisting) {
+				releaseLock();
+				log('Lock released.');
+			}
+			throw err;
+		}
+	}));
+
+// ── unstage ──────────────────────────────────────────────────
+
+program
+	.command('unstage')
+	.description('Unstage files while holding a multi-turn transaction lock')
+	.requiredOption('-f, --files <files...>', 'Files to unstage')
+	.option(
+		'-o, --owner <owner>',
+		'Lock owner to verify',
+		`pid-${process.pid}`,
+	)
+	.action(safeAction((opts) => {
+		const { files, owner } = opts;
+		validateLiteralFileInputs({ paths: files });
+		verifyOwnership(owner);
+
+		strictUnstageFiles(files);
+		log(`Unstaged ${files.length} file(s). Lock remains held.`);
 	}));
 
 // ── lock ─────────────────────────────────────────────────────

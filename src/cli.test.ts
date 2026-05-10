@@ -978,7 +978,289 @@ describe('git-atomic-commit', () => {
 		});
 	});
 
+	// ── stage / unstage ───────────────────────────────────────
+
+	describe('stage', () => {
+		test('stages files while keeping a detached transaction lock held', () => {
+			createFile('a.txt', 'hello\n');
+			createFile('b.txt', 'world\n');
+
+			const result = gac('stage -o "session-1" -t 120 -f a.txt b.txt');
+
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Lock acquired');
+			expect(result.stdout).toContain('Staged 2 file(s)');
+			expect(stagedFiles().sort()).toEqual(['a.txt', 'b.txt']);
+			expect(lockExists()).toBe(true);
+
+			const info = readLockInfo();
+			expect(info.owner).toBe('session-1');
+			expect(info.pid).toBe(-1);
+			expect(info.ttlSeconds).toBe(120);
+
+			gac('unlock -o "session-1"');
+		});
+
+		test('reuses an existing transaction lock for the same owner', () => {
+			createFile('a.txt', 'hello\n');
+			gac('lock -o "session-1"');
+
+			const result = gac('stage -o "session-1" -f a.txt');
+
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Using existing lock');
+			expect(stagedFiles()).toEqual(['a.txt']);
+			expect(lockExists()).toBe(true);
+			expect(readLockInfo().owner).toBe('session-1');
+
+			gac('unlock -o "session-1"');
+		});
+
+		test('does not stage when another owner holds the lock', () => {
+			createFile('a.txt', 'hello\n');
+			gac('lock -o "holder"');
+
+			const result = gac('stage -o "intruder" -f a.txt');
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('Lock held by "holder"');
+			expect(stagedFiles()).toEqual([]);
+			expect(readLockInfo().owner).toBe('holder');
+
+			gac('unlock --force');
+		});
+
+		test('releases a newly acquired lock when staging fails', () => {
+			const result = gac('stage -o "session-1" -f missing.txt');
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('missing.txt');
+			expect(lockExists()).toBe(false);
+		});
+	});
+
+	describe('unstage', () => {
+		test('unstages requested files while keeping the transaction lock held', () => {
+			createFile('a.txt', 'hello\n');
+			createFile('b.txt', 'world\n');
+			gac('stage -o "session-1" -f a.txt b.txt');
+
+			const result = gac('unstage -o "session-1" -f a.txt');
+
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Unstaged 1 file(s)');
+			expect(stagedFiles()).toEqual(['b.txt']);
+			expect(lockExists()).toBe(true);
+			expect(readLockInfo().owner).toBe('session-1');
+
+			gac('unlock -o "session-1"');
+		});
+
+		test('rejects unstage when the owner does not match', () => {
+			createFile('a.txt', 'hello\n');
+			gac('stage -o "session-1" -f a.txt');
+
+			const result = gac('unstage -o "other" -f a.txt');
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('not "other"');
+			expect(stagedFiles()).toEqual(['a.txt']);
+			expect(readLockInfo().owner).toBe('session-1');
+
+			gac('unlock --force');
+		});
+
+		test('unstages a staged deletion without hiding git failures', () => {
+			createFile('tracked.txt', 'v1\n');
+			gitCmd('add', 'tracked.txt');
+			gitCmd('commit', '-m', 'add tracked', '--no-verify');
+			gitCmd('rm', 'tracked.txt');
+			expect(stagedEntries()).toEqual([{ path: 'tracked.txt', status: 'D' }]);
+			gac('lock -o "session-1"');
+
+			const result = gac('unstage -o "session-1" -f tracked.txt');
+
+			expect(result.exitCode).toBe(0);
+			expect(stagedFiles()).toEqual([]);
+			expect(lockExists()).toBe(true);
+
+			gac('unlock -o "session-1"');
+		});
+
+		test('reports unstage failures instead of claiming success', () => {
+			gac('lock -o "session-1"');
+
+			const result = gac('unstage -o "session-1" -f missing.txt');
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('missing.txt');
+			expect(result.stdout + result.stderr).not.toContain('Unstaged 1 file(s)');
+			expect(lockExists()).toBe(true);
+
+			gac('unlock -o "session-1"');
+		});
+	});
+
 	// ── TTL validation ───────────────────────────────────────
+
+	describe('phantom-D auto-correct', () => {
+		// These tests exercise the post-commit audit in `restoreUnrelatedStaging`
+		// that detects and self-corrects "phantom" staged-deletions: index
+		// entries that say "deleted from tracking" while the on-disk file is
+		// byte-identical to HEAD's blob. Such entries can arise when a
+		// concurrent atomic-commit invocation's `temporarilyUnstage` window is
+		// observed by another's snapshot; without auto-correct, the D status
+		// gets re-applied on every subsequent commit and propagates forever.
+		test('auto-corrects a phantom staged-D when disk matches HEAD AND contention was observed', () => {
+			createFile('tracked.txt', 'committed content\n');
+			createFile('other.txt', 'sibling\n');
+			gitCmd('add', 'tracked.txt', 'other.txt');
+			gitCmd('commit', '-m', 'baseline', '--no-verify');
+
+			// Manually corrupt the index: stage D for tracked.txt while
+			// disk content still matches HEAD. This is the rubber-checkout
+			// reproduction case.
+			gitCmd('rm', '--cached', 'tracked.txt');
+			expect(stagedFiles()).toContain('tracked.txt');
+
+			// Force the CLI to observe CS-lock contention by pre-creating
+			// a stale sentinel — the spinner will see EEXIST, mark
+			// `csLockContended=true`, then reclaim and proceed. Without
+			// observed contention the auto-correct is intentionally a
+			// no-op (preserves intentional `git rm --cached` semantics).
+			const csLock = join(tmpRepo, '.git', 'atomic-commit.cs-lock');
+			writeFileSync(csLock, `99999\n0\n`);
+			const tenMinAgoSec = Math.floor(Date.now() / 1000) - 600;
+			execSync(
+				`touch -t $(date -r ${tenMinAgoSec} +%Y%m%d%H%M.%S) "${csLock}"`,
+				{ stdio: 'pipe' },
+			);
+
+			createFile('other2.txt', 'fresh\n');
+			const stdout = execSync(
+				`GAC_CS_STALE_MS=60000 GAC_CS_WAIT_MS=2000 ` +
+					`bun "${CLI}" commit -f other2.txt -m "test: phantom-D" --no-verify 2>&1`,
+				{ encoding: 'utf-8', cwd: tmpRepo, stdio: 'pipe' },
+			);
+
+			expect(stdout).toContain('Commit successful');
+			expect(stdout).toContain('Auto-corrected 1 phantom staged-deletion');
+			expect(stagedFiles()).not.toContain('tracked.txt');
+		});
+
+		test('preserves a genuine staged-D when disk content differs from HEAD', () => {
+			createFile('tracked.txt', 'original\n');
+			createFile('other.txt', 'sibling\n');
+			gitCmd('add', 'tracked.txt', 'other.txt');
+			gitCmd('commit', '-m', 'baseline', '--no-verify');
+
+			// Stage delete + write divergent on-disk content. User intent
+			// is real (replacing the file with something else), so auto-
+			// correct must NOT undo it.
+			gitCmd('rm', '--cached', 'tracked.txt');
+			createFile('tracked.txt', 'totally different scratch\n');
+
+			createFile('other2.txt', 'fresh\n');
+			const result = gac('commit -f other2.txt -m "test: real-D" --no-verify');
+
+			expect(result.exitCode).toBe(0);
+			expect(result.stderr + result.stdout).not.toContain('Auto-corrected');
+			expect(stagedFiles()).toContain('tracked.txt');
+		});
+
+		test('preserves a genuine staged-D when the file is gone from disk', () => {
+			createFile('tracked.txt', 'original\n');
+			createFile('other.txt', 'sibling\n');
+			gitCmd('add', 'tracked.txt', 'other.txt');
+			gitCmd('commit', '-m', 'baseline', '--no-verify');
+
+			gitCmd('rm', 'tracked.txt');
+			expect(existsSync(join(tmpRepo, 'tracked.txt'))).toBe(false);
+
+			createFile('other2.txt', 'fresh\n');
+			const result = gac('commit -f other2.txt -m "test: real-rm" --no-verify');
+
+			expect(result.exitCode).toBe(0);
+			expect(result.stderr + result.stdout).not.toContain('Auto-corrected');
+			expect(stagedFiles()).toContain('tracked.txt');
+		});
+	});
+
+	describe('critical-section mutex', () => {
+		// Process-bound sentinel that serializes the snapshot→unstage→commit
+		// →restore phase across concurrent invocations regardless of owner.
+		// Production timings (60s wait, 2min staleness) are too long for
+		// tests; we inject GAC_CS_* env overrides to compress them.
+		const csLockPath = (): string =>
+			join(tmpRepo, '.git', 'atomic-commit.cs-lock');
+
+		test('sentinel is created and cleaned up around a successful commit', () => {
+			createFile('a.txt');
+			expect(existsSync(csLockPath())).toBe(false);
+			const result = gac('commit -f a.txt -m "test" --no-verify');
+			expect(result.exitCode).toBe(0);
+			expect(existsSync(csLockPath())).toBe(false);
+		});
+
+		test('sentinel is cleaned up after a failed commit', () => {
+			createFile('a.txt');
+			// Empty commit message → git commit fails.
+			const result = gac('commit -f a.txt -m "" --no-verify');
+			expect(result.exitCode).not.toBe(0);
+			expect(existsSync(csLockPath())).toBe(false);
+		});
+
+		test('contention: second invocation waits and times out when sentinel is fresh', () => {
+			createFile('a.txt');
+			// Pre-create the sentinel with a fresh mtime to simulate another
+			// process holding the critical section.
+			writeFileSync(csLockPath(), `${process.pid}\n${Date.now()}\n`);
+
+			let stdout = '';
+			let stderr = '';
+			let exitCode = 0;
+			try {
+				stdout = execSync(
+					`GAC_CS_WAIT_MS=1000 GAC_CS_STALE_MS=600000 GAC_CS_POLL_MIN_MS=50 GAC_CS_POLL_MAX_MS=100 ` +
+						`bun "${CLI}" commit -f a.txt -m "test" --no-verify 2>&1`,
+					{ encoding: 'utf-8', cwd: tmpRepo, stdio: 'pipe' },
+				);
+			} catch (err: any) {
+				stdout = err.stdout?.toString() ?? '';
+				stderr = err.stderr?.toString() ?? '';
+				exitCode = err.status ?? 1;
+			}
+
+			const combined = stdout + stderr;
+			expect(combined).toContain('critical-section lock contention');
+			expect(exitCode).not.toBe(0);
+
+			// Clean up so afterEach doesn't see leftover state.
+			try {
+				rmSync(csLockPath());
+			} catch {}
+		});
+
+		test('staleness: second invocation reclaims when sentinel is older than threshold', () => {
+			createFile('a.txt');
+			// Pre-create sentinel and backdate it well past the staleness
+			// threshold so the invocation immediately reclaims it.
+			writeFileSync(csLockPath(), `99999\n0\n`);
+			const tenMinAgoSec = Math.floor(Date.now() / 1000) - 600;
+			execSync(
+				`touch -t $(date -r ${tenMinAgoSec} +%Y%m%d%H%M.%S) "${csLockPath()}"`,
+				{ stdio: 'pipe' },
+			);
+
+			const stdout = execSync(
+				`GAC_CS_WAIT_MS=2000 GAC_CS_STALE_MS=60000 ` +
+					`bun "${CLI}" commit -f a.txt -m "test" --no-verify 2>&1`,
+				{ encoding: 'utf-8', cwd: tmpRepo, stdio: 'pipe' },
+			);
+			expect(stdout).toContain('Commit successful');
+			expect(existsSync(csLockPath())).toBe(false);
+		});
+	});
 
 	describe('TTL validation', () => {
 		test('rejects non-numeric TTL', () => {
@@ -1001,7 +1283,7 @@ describe('git-atomic-commit', () => {
 	// ── multi-turn transaction flow ──────────────────────────
 
 	describe('multi-turn transaction', () => {
-		test('lock → commit reuses the lock and releases on success', () => {
+		test('lock → commit reuses the lock and leaves cleanup to the owner', () => {
 			createFile('a.txt');
 
 			gac('lock -o "session-1"');
@@ -1014,16 +1296,35 @@ describe('git-atomic-commit', () => {
 			expect(result.stdout).toContain('Using existing lock');
 			expect(result.stdout).toContain('Commit successful');
 
-			// Lock should be released after commit succeeds
-			// (commit with reused lock still releases it)
-			// Actually — when reusing, we do NOT release. Agent must unlock.
-			// Let's check our implementation:
-			// weAcquired = false when reusing, so finally does NOT release.
+			// A reused multi-turn lock is intentionally not released by commit.
 			expect(lockExists()).toBe(true);
 
 			// Agent cleans up
 			gac('unlock -o "session-1"');
 			expect(lockExists()).toBe(false);
+		});
+
+		test('stage → inspect → commit keeps one transaction lock throughout', () => {
+			createFile('a.txt', 'hello\n');
+			createFile('b.txt', 'world\n');
+
+			const stageResult = gac('stage -o "session-1" -f a.txt b.txt');
+			expect(stageResult.exitCode).toBe(0);
+			expect(stagedFiles().sort()).toEqual(['a.txt', 'b.txt']);
+			expect(lockExists()).toBe(true);
+
+			const commitResult = gac(
+				'commit -o "session-1" -f a.txt b.txt -m "test: staged transaction" --no-verify',
+			);
+
+			expect(commitResult.exitCode).toBe(0);
+			expect(commitResult.stdout).toContain('Using existing lock');
+			expect(commitResult.stdout).toContain('Commit successful');
+			expect(filesInHead().sort()).toEqual(['a.txt', 'b.txt']);
+			expect(stagedFiles()).toEqual([]);
+			expect(lockExists()).toBe(true);
+
+			gac('unlock -o "session-1"');
 		});
 	});
 });
