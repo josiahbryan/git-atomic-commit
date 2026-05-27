@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **End-of-stdout `[<branch> <sha>] <subject>` re-emission on successful commits.** Native `git commit` prints this line once near the start of its output, but downstream tools that buffer commit output (notably Claude Code's Bash tool, which truncates large outputs FROM THE MIDDLE) routinely drop it when the precommit pipeline emits a lot of text. The result is silent commit-attribution misses: parsers like `agent-hooks.ts#extractCommitShaFromOutput` (used by Rubber's BC task-attribution path) see no `[branch sha]` line and skip writing the (task, sha) linkage row. Re-emitting at the very end — after `[git-atomic-commit] Lock released.` — guarantees the SHA survives middle-truncation. Format mirrors git's native shape exactly (`[<branch> <short-sha>] <subject>`, using `git rev-parse --short=8 HEAD`) so existing regexes like `/^\[[^\]]+ ([0-9a-f]{7,40})\]/` match unchanged; consumers that scan for the LAST match (the documented agent-hooks behaviour) get the trailing SHA authoritatively. Best-effort: if HEAD-read fails after a successful commit (transient git error, repo damage), skip silently rather than turning a successful commit into a failed exit. Only emitted on the success path — failure rollback leaves stdout untouched. Two new tests in `cli.test.ts` cover both branches.
+
+### Fixed
+
+- **Test infrastructure: `createTestRepo` no longer calls `git config user.email`/`user.name`**, which the latest `git-guardrails` blocks (repo-config writes pollute other users committing in the same repo). Author and committer identity now flow in via `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` / `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL` env vars on `GIT_TEST_ENV` — the guardrail's own recommended alternative. `gac()` also now passes `GIT_TEST_ENV` to its `execSync` so the inner `cli.ts` git subprocesses inherit the identity vars. All 63 tests passed pre-existing locally only because the developer's git config was set globally; pristine CI environments would have failed every test at setup.
+
 ## [1.5.0] - 2026-05-09
 
 ### Added

@@ -1180,6 +1180,37 @@ program
 			}
 			uninstallSignalHandlers();
 		}
+		// Re-emit git's "[<branch> <sha>] <subject>" line at the end of
+		// stdout on success. Native `git commit` prints this line once near
+		// the start of its output, but downstream tools that buffer commit
+		// output (e.g. Claude Code's Bash tool, which truncates large
+		// outputs FROM THE MIDDLE) routinely drop it when the precommit
+		// pipeline emits a lot of text. The result is silent commit-
+		// attribution misses: parsers see no `[branch sha]` line and skip
+		// writing the (task, sha) linkage row. Re-emitting at the very end
+		// — after the lock-release log — guarantees the SHA survives
+		// middle-truncation. Format mirrors git's native shape exactly so
+		// existing regexes like `/^\[[^\]]+ ([0-9a-f]{7,40})\]/` match
+		// unchanged; consumers that scan for the LAST match (the documented
+		// agent-hooks behaviour: `chained git commit && git commit lands
+		// HEAD on the second, so use the last`) get the authoritative SHA
+		// here regardless of any earlier truncated match.
+		//
+		// Best-effort: if HEAD-read fails after a successful commit (e.g.
+		// transient git error, repo damage), skip silently rather than
+		// turning a successful commit into a failed exit. The original
+		// `[branch sha]` line earlier in the output is still authoritative
+		// when present.
+		if (!commitFailed) {
+			try {
+				const branch = git('rev-parse', '--abbrev-ref', 'HEAD');
+				const shortSha = git('rev-parse', '--short=8', 'HEAD');
+				const subject = (message.split('\n')[0] ?? '').trim();
+				console.log(`[${branch} ${shortSha}] ${subject}`);
+			} catch {
+				// noop — see comment above
+			}
+		}
 		if (commitFailed) process.exit(1);
 	}));
 

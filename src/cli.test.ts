@@ -17,7 +17,21 @@ import { join } from 'node:path';
 const CLI = join(import.meta.dir, 'cli.ts');
 
 /** Allow raw git in tests when git-guardrails is installed (same bypass as the CLI). */
-const GIT_TEST_ENV = { ...process.env, GIT_ATOMIC_COMMIT: '1' };
+// Author / committer identity is injected via env vars rather than
+// `git config user.email/name` because git-guardrails (which is installed
+// in josiah's dev env) blocks the latter as an anti-footgun rule —
+// writing identity to a repo's config pollutes other users. Env vars are
+// the guardrail's own recommended alternative and scope cleanly to this
+// process. GIT_ATOMIC_COMMIT=1 tells git-guardrails to allow the inner
+// `git add`/`git commit` calls through.
+const GIT_TEST_ENV = {
+	...process.env,
+	GIT_ATOMIC_COMMIT: '1',
+	GIT_AUTHOR_NAME: 'Test',
+	GIT_AUTHOR_EMAIL: 'test@test.com',
+	GIT_COMMITTER_NAME: 'Test',
+	GIT_COMMITTER_EMAIL: 'test@test.com',
+};
 
 /** Run git-atomic-commit in a given cwd, return { stdout, stderr, exitCode } */
 function gac(
@@ -30,6 +44,11 @@ function gac(
 			encoding: 'utf-8',
 			cwd,
 			stdio: 'pipe',
+			// Pass GIT_TEST_ENV so cli.ts's inner git subprocesses see the
+			// GIT_AUTHOR_* / GIT_COMMITTER_* identity vars + GIT_ATOMIC_COMMIT
+			// (the latter is how git-guardrails knows these calls are
+			// authorised; see top-of-file comment on GIT_TEST_ENV).
+			env: GIT_TEST_ENV,
 		});
 		return { stdout, stderr: '', exitCode: 0 };
 	} catch (err: any) {
@@ -112,16 +131,8 @@ function createTestRepo(): string {
 	);
 	mkdirSync(dir, { recursive: true });
 	execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe', env: GIT_TEST_ENV });
-	execFileSync('git', ['config', 'user.email', 'test@test.com'], {
-		cwd: dir,
-		stdio: 'pipe',
-		env: GIT_TEST_ENV,
-	});
-	execFileSync('git', ['config', 'user.name', 'Test'], {
-		cwd: dir,
-		stdio: 'pipe',
-		env: GIT_TEST_ENV,
-	});
+	// No `git config user.email/name` here — identity flows in via
+	// GIT_AUTHOR_* / GIT_COMMITTER_* on GIT_TEST_ENV (see top of file for why).
 	// Initial commit so HEAD exists
 	writeFileSync(join(dir, '.gitkeep'), '');
 	execFileSync('git', ['add', '.gitkeep'], {
@@ -176,6 +187,50 @@ describe('git-atomic-commit', () => {
 			createFile('a.txt');
 			gac('commit -f a.txt -m "test" --no-verify');
 			expect(lockExists()).toBe(false);
+		});
+
+		test('emits a parseable `[branch sha] subject` line at the end of stdout on success', () => {
+			// Why: downstream tools (Claude Code Bash tool, log truncators)
+			// frequently drop git's native `[branch sha]` line — it appears
+			// near the START of output and gets sliced away when the body
+			// is truncated from the middle. This trailing emission survives
+			// because it's the very last thing printed.
+			createFile('a.txt');
+			const result = gac(
+				'commit -f a.txt -m "test: trailing sha line emitted" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+
+			// Regex mirrors the one in agent-hooks.ts#extractCommitShaFromOutput
+			// — `[<branch> <sha>] <subject>`. Multi-line + case-insensitive so
+			// behaviour matches the consumer exactly.
+			const sha = gitCmd('rev-parse', '--short=8', 'HEAD');
+			const branch = gitCmd('rev-parse', '--abbrev-ref', 'HEAD');
+			const expectedLine = `[${branch} ${sha}] test: trailing sha line emitted`;
+			const lines = result.stdout.split('\n');
+			// The line we add is the LAST non-empty output line.
+			const lastNonEmpty = [...lines].reverse().find((l) => l.trim().length > 0);
+			expect(lastNonEmpty).toBe(expectedLine);
+
+			// And the existing agent-hooks regex matches it.
+			const re = /^\[[^\]]+ ([0-9a-f]{7,40})\]/gim;
+			const matches = [...result.stdout.matchAll(re)];
+			expect(matches.length).toBeGreaterThanOrEqual(1);
+			const last = matches[matches.length - 1];
+			expect(last?.[1]).toBe(sha);
+		});
+
+		test('does NOT emit the trailing sha line on commit failure', () => {
+			createFile('a.txt');
+			// Empty message → commit fails (matches the rollback test above).
+			const result = gac('commit -f a.txt -m "" --no-verify');
+			expect(result.exitCode).not.toBe(0);
+			// No `[branch hex]` line in failure-path output. (The lock-release
+			// log line `[git-atomic-commit] Lock released.` would NOT match the
+			// regex anyway because it has no space-then-hex inside the
+			// brackets — but assert the absence directly for explicitness.)
+			const re = /^\[[^\]]+ ([0-9a-f]{7,40})\]/gim;
+			expect([...result.stdout.matchAll(re)].length).toBe(0);
 		});
 
 		test('rolls back staging on commit failure and releases lock', () => {
