@@ -330,6 +330,52 @@ describe('git-atomic-commit', () => {
 			]);
 		});
 
+		test('restores unrelated staged ignored files after atomic commit', () => {
+			createFile('.gitignore', 'ignored-dir/\n');
+			mkdirSync(join(tmpRepo, 'ignored-dir'), { recursive: true });
+			createFile('ignored-dir/force-staged.txt', 'ignored but intentionally staged\n');
+			gitCmd('add', '.gitignore');
+			gitCmd('commit', '-m', 'add ignore rule', '--no-verify');
+
+			// Simulate another agent intentionally staging an ignored file.
+			// Restore must preserve that existing index state even though
+			// plain `git add` would refuse the file after temporary unstaging.
+			gitCmd('add', '-f', 'ignored-dir/force-staged.txt');
+			expect(stagedEntries()).toEqual([
+				{ path: 'ignored-dir/force-staged.txt', status: 'A' },
+			]);
+
+			createFile('ours.txt', 'ours\n');
+
+			const result = gac(
+				'commit -f ours.txt -m "test: restore ignored staged add" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout + result.stderr).not.toContain('Failed to restore');
+			expect(filesInHead()).toEqual(['ours.txt']);
+			expect(stagedEntries()).toEqual([
+				{ path: 'ignored-dir/force-staged.txt', status: 'A' },
+			]);
+		});
+
+		test('accepts cwd-relative file paths when run from a subdirectory', () => {
+			mkdirSync(join(tmpRepo, 'backend'), { recursive: true });
+			createFile('root-unrelated.txt', 'already staged elsewhere\n');
+			createFile('backend/ours.txt', 'ours from subdir\n');
+			gitCmd('add', 'root-unrelated.txt');
+
+			const result = gac(
+				'commit -f ours.txt -m "test: commit from subdir" --no-verify',
+				{ cwd: join(tmpRepo, 'backend') },
+			);
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout + result.stderr).not.toContain('Failed to restore');
+			expect(filesInHead()).toEqual(['backend/ours.txt']);
+			expect(stagedEntries()).toEqual([
+				{ path: 'root-unrelated.txt', status: 'A' },
+			]);
+		});
+
 		/**
 		 * Same isolation contract, but on the failure path: even when the
 		 * commit fails (empty message), the unrelated staged files must be

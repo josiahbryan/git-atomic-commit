@@ -15,7 +15,7 @@ import {
 	statSync,
 	constants as fsConstants,
 } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative as pathRelative, resolve } from 'node:path';
 
 import packageJson from '../package.json';
 
@@ -153,6 +153,11 @@ function gitCaptureAndReplay(...args: string[]): void {
 let _gitDir: string | undefined;
 function getGitDir(): string {
 	return (_gitDir ??= git('rev-parse', '--git-dir'));
+}
+
+let _repoRoot: string | undefined;
+function getRepoRoot(): string {
+	return (_repoRoot ??= git('rev-parse', '--show-toplevel'));
 }
 
 function getLockDir(): string {
@@ -440,7 +445,10 @@ function temporarilyUnstageUnrelated({
  *     handles both the "file deleted from disk + indexed" and the
  *     `git rm --cached` (file kept on disk, removed from index) cases —
  *     either way, the staged state we want is "absent from index".
- *   - A/M/R/C/T: `git add` re-stages the current working-tree contents.
+ *   - A/M/R/C/T: `git add -f` re-stages the current working-tree contents.
+ *     Force is intentional here: the file was already staged before we
+ *     touched it, so restore must preserve that index state even if an
+ *     ignore rule would reject a plain `git add` after temporary unstaging.
  *     We deliberately do NOT capture and restore the original blob, so
  *     this loses partial-hunk selections (which is why the commit action
  *     refuses to proceed when those are detected — see
@@ -474,6 +482,7 @@ function restoreUnrelatedStaging({
 					'git',
 					[
 						'add',
+						'-f',
 						'--',
 						toLiteralPathspec({ relativePath: entry.path }),
 					],
@@ -552,13 +561,14 @@ function restoreUnrelatedStaging({
  */
 function isPhantomStagedDelete(path: string): boolean {
 	try {
-		if (!existsSync(path)) return false;
+		const absolutePath = resolve(getRepoRoot(), path);
+		if (!existsSync(absolutePath)) return false;
 		// `HEAD:<path>` accepts a plain path, not a pathspec magic prefix.
 		// Use the raw relative path here. Quoting-safe because we never
 		// shell-interpolate — execFileSync passes args as a list.
 		const headBlob = git('rev-parse', `HEAD:${path}`).trim();
 		if (!headBlob || headBlob.startsWith('fatal')) return false;
-		const diskBlob = git('hash-object', '--', path).trim();
+		const diskBlob = git('hash-object', '--', absolutePath).trim();
 		return Boolean(headBlob) && headBlob === diskBlob;
 	} catch {
 		return false;
@@ -578,7 +588,7 @@ function toLiteralPathspec({
 }: {
 	relativePath: string;
 }): string {
-	return `:(literal)${relativePath}`;
+	return `:(top,literal)${relativePath}`;
 }
 
 function toLiteralPathspecs({ paths }: { paths: string[] }): string[] {
@@ -627,7 +637,7 @@ function pathExistsIncludingBrokenSymlink({
 	relativePath: string;
 }): boolean {
 	try {
-		lstatSync(resolve(process.cwd(), relativePath));
+		lstatSync(resolve(getRepoRoot(), relativePath));
 		return true;
 	} catch {
 		return false;
@@ -639,8 +649,26 @@ function isDirectoryInput({
 }: {
 	relativePath: string;
 }): boolean {
-	const absolutePath = resolve(process.cwd(), relativePath);
+	const absolutePath = resolve(getRepoRoot(), relativePath);
 	return pathExistsIncludingBrokenSymlink({ relativePath }) && lstatSync(absolutePath).isDirectory();
+}
+
+function toRepoRelativePath({ inputPath }: { inputPath: string }): string {
+	const absolutePath = resolve(process.cwd(), inputPath);
+	const relativePath = pathRelative(getRepoRoot(), absolutePath).replace(/\\/g, '/');
+	if (
+		relativePath.length === 0 ||
+		relativePath === '..' ||
+		relativePath.startsWith('../') ||
+		isAbsolute(relativePath)
+	) {
+		throw new Error(`--files path must be inside the git worktree: ${inputPath}`);
+	}
+	return relativePath;
+}
+
+function toRepoRelativePaths({ paths }: { paths: string[] }): string[] {
+	return paths.map((inputPath) => toRepoRelativePath({ inputPath }));
 }
 
 /**
@@ -996,7 +1024,8 @@ program
 		'0',
 	)
 	.action(safeAction((opts) => {
-		const { files, message, owner, verify } = opts;
+		const { message, owner, verify } = opts;
+		const files = toRepoRelativePaths({ paths: opts.files });
 		const ttl = parseTtl(opts.ttl);
 		const waitSeconds = parseWait(opts.wait);
 		validateLiteralFileInputs({ paths: files });
@@ -1236,7 +1265,8 @@ program
 		'0',
 	)
 	.action(safeAction((opts) => {
-		const { files, owner } = opts;
+		const { owner } = opts;
+		const files = toRepoRelativePaths({ paths: opts.files });
 		const ttl = parseTtl(opts.ttl);
 		const waitSeconds = parseWait(opts.wait);
 		validateLiteralFileInputs({ paths: files });
@@ -1284,7 +1314,8 @@ program
 		`pid-${process.pid}`,
 	)
 	.action(safeAction((opts) => {
-		const { files, owner } = opts;
+		const { owner } = opts;
+		const files = toRepoRelativePaths({ paths: opts.files });
 		validateLiteralFileInputs({ paths: files });
 		verifyOwnership(owner);
 
