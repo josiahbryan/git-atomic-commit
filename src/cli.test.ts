@@ -582,6 +582,45 @@ describe('git-atomic-commit', () => {
 			expect(existsSync(join(tmpRepo, 'gone.txt'))).toBe(true);
 		});
 
+		test('commits an UNSTAGED deletion via -f (rm in working tree)', () => {
+			createFile('to-delete.txt', 'bye\n');
+			gitCmd('add', 'to-delete.txt');
+			gitCmd('commit', '-m', 'add to-delete', '--no-verify');
+
+			// Delete from the working tree only (unstaged deletion).
+			rmSync(join(tmpRepo, 'to-delete.txt'));
+
+			const result = gac(
+				'commit -f to-delete.txt -m "test: remove file" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only');
+			expect(treeFiles.split('\n').filter(Boolean)).not.toContain(
+				'to-delete.txt',
+			);
+		});
+
+		test('commits an ALREADY-STAGED deletion via -f (git rm first)', () => {
+			createFile('staged-del.txt', 'bye\n');
+			gitCmd('add', 'staged-del.txt');
+			gitCmd('commit', '-m', 'add staged-del', '--no-verify');
+
+			// Stage the deletion first (gone from working tree AND index).
+			gitCmd('rm', 'staged-del.txt');
+			expect(stagedEntries().find((e) => e.path === 'staged-del.txt')?.status).toBe(
+				'D',
+			);
+
+			const result = gac(
+				'commit -f staged-del.txt -m "test: remove pre-staged" --no-verify',
+			);
+			expect(result.exitCode).toBe(0);
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only');
+			expect(treeFiles.split('\n').filter(Boolean)).not.toContain(
+				'staged-del.txt',
+			);
+		});
+
 		test('rejects directory inputs so staging stays file-exact', () => {
 			mkdirSync(join(tmpRepo, 'dir'));
 			createFile('dir/a.txt', 'hello\n');

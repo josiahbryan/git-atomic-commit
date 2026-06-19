@@ -703,7 +703,8 @@ function validateLiteralFileInputs({ paths }: { paths: string[] }): void {
  * undo the staged deletion. Skip `git add` for those paths so the deletion
  * stays staged (user can still commit the removal).
  */
-function fileWouldReviveStagedDeletion({
+/** True when this path's index-vs-HEAD status is a staged deletion (`D`). */
+function isStagedDeletion({
 	relativePath,
 }: {
 	relativePath: string;
@@ -716,8 +717,18 @@ function fileWouldReviveStagedDeletion({
 		toLiteralPathspec({ relativePath }),
 	);
 	const line = staged.split('\n')[0]?.trim() ?? '';
-	if (!line.startsWith('D')) return false;
-	return pathExistsIncludingBrokenSymlink({ relativePath });
+	return line.startsWith('D');
+}
+
+function fileWouldReviveStagedDeletion({
+	relativePath,
+}: {
+	relativePath: string;
+}): boolean {
+	return (
+		isStagedDeletion({ relativePath }) &&
+		pathExistsIncludingBrokenSymlink({ relativePath })
+	);
 }
 
 function pathsSafeForPlainGitAdd({ paths }: { paths: string[] }): string[] {
@@ -726,7 +737,38 @@ function pathsSafeForPlainGitAdd({ paths }: { paths: string[] }): string[] {
 
 function stageFiles(files: string[]): void {
 	if (files.length === 0) return;
-	gitCaptureAndReplay('add', '--', ...toLiteralPathspecs({ paths: files }));
+
+	// Split present (add/modify) from absent (deleted from the working tree).
+	// Plain `git add -- <path>` errors "pathspec did not match any files" on a
+	// gone path, so deletions can never be committed via --files without this.
+	const present: string[] = [];
+	const absent: string[] = [];
+	for (const f of files) {
+		if (pathExistsIncludingBrokenSymlink({ relativePath: f })) present.push(f);
+		else absent.push(f);
+	}
+
+	// Present files: plain `git add` (callers already filtered staged-deletion-
+	// revival cases via pathsSafeForPlainGitAdd).
+	if (present.length > 0) {
+		gitCaptureAndReplay('add', '--', ...toLiteralPathspecs({ paths: present }));
+	}
+
+	// Deleted files: stage the REMOVAL. `git add -A` records deletions (plain
+	// `git add` can't). Skip paths whose deletion is ALREADY staged — there's
+	// nothing in the working tree or index for `-A` to match, so it would error
+	// "pathspec did not match" even though the desired state is already achieved.
+	const absentNeedingStage = absent.filter(
+		(f) => !isStagedDeletion({ relativePath: f }),
+	);
+	if (absentNeedingStage.length > 0) {
+		gitCaptureAndReplay(
+			'add',
+			'-A',
+			'--',
+			...toLiteralPathspecs({ paths: absentNeedingStage }),
+		);
+	}
 }
 
 /**
