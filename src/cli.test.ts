@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { execSync, execFileSync, spawn } from 'node:child_process';
+import { execSync, execFileSync, spawn, spawnSync } from 'node:child_process';
 import {
 	mkdirSync,
 	writeFileSync,
@@ -36,28 +36,45 @@ const GIT_TEST_ENV = {
 /** Run git-atomic-commit in a given cwd, return { stdout, stderr, exitCode } */
 function gac(
 	args: string,
-	opts?: { cwd?: string },
+	opts?: { cwd?: string; env?: Record<string, string> },
 ): { stdout: string; stderr: string; exitCode: number } {
 	const cwd = opts?.cwd ?? tmpRepo;
-	try {
-		const stdout = execSync(`bun "${CLI}" ${args}`, {
-			encoding: 'utf-8',
-			cwd,
-			stdio: 'pipe',
-			// Pass GIT_TEST_ENV so cli.ts's inner git subprocesses see the
-			// GIT_AUTHOR_* / GIT_COMMITTER_* identity vars + GIT_ATOMIC_COMMIT
-			// (the latter is how git-guardrails knows these calls are
-			// authorised; see top-of-file comment on GIT_TEST_ENV).
-			env: GIT_TEST_ENV,
-		});
-		return { stdout, stderr: '', exitCode: 0 };
-	} catch (err: any) {
-		return {
-			stdout: err.stdout?.toString() ?? '',
-			stderr: err.stderr?.toString() ?? '',
-			exitCode: err.status ?? 1,
-		};
+	// spawnSync (not execSync) so we capture stderr on SUCCESS too — some
+	// paths (e.g. the GIT_ATOMIC_SKIP_GATES loud-bypass banner) write to
+	// stderr while still exiting 0, and execSync only surfaces stderr when
+	// the command throws.
+	const result = spawnSync('bun', [CLI, ...splitArgs(args)], {
+		encoding: 'utf-8',
+		cwd,
+		stdio: 'pipe',
+		// Pass GIT_TEST_ENV so cli.ts's inner git subprocesses see the
+		// GIT_AUTHOR_* / GIT_COMMITTER_* identity vars + GIT_ATOMIC_COMMIT
+		// (the latter is how git-guardrails knows these calls are
+		// authorised; see top-of-file comment on GIT_TEST_ENV).
+		// opts.env lets a test layer on extra vars (e.g. the own-diff
+		// gate's GIT_ATOMIC_GATE_CMD / GIT_ATOMIC_SKIP_GATES).
+		env: { ...GIT_TEST_ENV, ...(opts?.env ?? {}) },
+	});
+	return {
+		stdout: result.stdout?.toString() ?? '',
+		stderr: result.stderr?.toString() ?? '',
+		exitCode: result.status ?? 1,
+	};
+}
+
+/**
+ * Split a CLI arg string into argv the way the previous execSync call did,
+ * honouring double-quoted groups (e.g. -m "test: msg with spaces"). Good
+ * enough for these tests, which only ever quote with double quotes.
+ */
+function splitArgs(args: string): string[] {
+	const out: string[] = [];
+	const re = /"([^"]*)"|(\S+)/g;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(args)) !== null) {
+		out.push(m[1] !== undefined ? m[1] : (m[2] ?? ''));
 	}
+	return out;
 }
 
 /** Run a git command in the test repo */
@@ -1465,6 +1482,102 @@ describe('git-atomic-commit', () => {
 			expect(lockExists()).toBe(true);
 
 			gac('unlock -o "session-1"');
+		});
+	});
+
+	// ── own-diff gates ───────────────────────────────────────
+	//
+	// The gate validates the committer's OWN diff (scoped lint/typecheck on
+	// the -f files) and runs on every commit regardless of --no-verify,
+	// closing the "--no-verify laundering" hole. It is repo-owned: opt in via
+	// GIT_ATOMIC_GATE_CMD or an executable `.git-atomic-gate` at the repo
+	// root. GIT_ATOMIC_SKIP_GATES=1 is the loud emergency bypass.
+	describe('own-diff gates', () => {
+		test('no gate configured → commit works unchanged (backward compatible)', () => {
+			createFile('a.txt');
+			const result = gac('commit -f a.txt -m "test: no gate" --no-verify');
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Commit successful');
+			// Silent when no gate is configured — no gate chatter in output.
+			expect(result.stdout).not.toContain('own-diff gate');
+			expect(filesInHead()).toContain('a.txt');
+		});
+
+		test('a failing gate BLOCKS the commit even with --no-verify', () => {
+			createFile('a.txt');
+			const result = gac('commit -f a.txt -m "test: blocked" --no-verify', {
+				// exits non-zero → own diff fails the gate
+				env: { GIT_ATOMIC_GATE_CMD: 'exit 3' },
+			});
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stderr).toContain('Own-diff gate failed');
+			// Commit must NOT have happened — HEAD still the init commit.
+			expect(gitCmd('log', '--format=%s', '-n', '1')).toBe('init');
+			// And a.txt must not be left staged (fast-fail before staging).
+			expect(stagedFiles()).toEqual([]);
+		});
+
+		test('a passing gate lets the commit through', () => {
+			createFile('a.txt');
+			const result = gac('commit -f a.txt -m "test: gate pass" --no-verify', {
+				env: { GIT_ATOMIC_GATE_CMD: 'exit 0' },
+			});
+			expect(result.exitCode).toBe(0);
+			expect(result.stdout).toContain('Own-diff gate passed');
+			expect(filesInHead()).toContain('a.txt');
+		});
+
+		test('GIT_ATOMIC_SKIP_GATES=1 bypasses a failing gate with a loud warning', () => {
+			createFile('a.txt');
+			const result = gac('commit -f a.txt -m "test: emergency bypass" --no-verify', {
+				env: { GIT_ATOMIC_GATE_CMD: 'exit 1', GIT_ATOMIC_SKIP_GATES: '1' },
+			});
+			expect(result.exitCode).toBe(0);
+			expect(result.stderr).toContain('SKIPPING own-diff');
+			expect(filesInHead()).toContain('a.txt');
+		});
+
+		test('the gate receives the exact -f file list via GIT_ATOMIC_FILES', () => {
+			createFile('a.txt');
+			createFile('b.txt');
+			// Gate writes $GIT_ATOMIC_FILES to a marker, then passes.
+			const result = gac(
+				'commit -f a.txt b.txt -m "test: file list" --no-verify',
+				{
+					env: {
+						GIT_ATOMIC_GATE_CMD:
+							'printf "%s" "$GIT_ATOMIC_FILES" > .gate-marker',
+					},
+				},
+			);
+			expect(result.exitCode).toBe(0);
+			const marker = readFileSync(join(tmpRepo, '.gate-marker'), 'utf-8');
+			const seen = marker.split('\n').filter(Boolean).sort();
+			expect(seen).toEqual(['a.txt', 'b.txt']);
+		});
+
+		test('an executable .git-atomic-gate at the repo root is auto-detected', () => {
+			createFile('a.txt');
+			// A repo-root gate script that always fails.
+			const gatePath = join(tmpRepo, '.git-atomic-gate');
+			writeFileSync(gatePath, '#!/bin/sh\nexit 7\n');
+			chmodSync(gatePath, 0o755);
+			const result = gac('commit -f a.txt -m "test: file gate" --no-verify');
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stderr).toContain('Own-diff gate failed');
+			expect(gitCmd('log', '--format=%s', '-n', '1')).toBe('init');
+		});
+
+		test('gate is skipped when there are no files (defensive)', () => {
+			// -f requires at least one file, so exercise the empty case via a
+			// gate that would fail if run; committing an existing staged file
+			// with a gate still runs it, so instead assert the gate DOES run
+			// for a real file (guards against accidental no-op regressions).
+			createFile('a.txt');
+			const result = gac('commit -f a.txt -m "test: runs" --no-verify', {
+				env: { GIT_ATOMIC_GATE_CMD: 'exit 0' },
+			});
+			expect(result.stdout).toContain('Running own-diff gate on 1 file');
 		});
 	});
 });

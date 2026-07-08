@@ -164,6 +164,151 @@ function getLockDir(): string {
 	return join(resolve(getGitDir()), LOCK_DIR_NAME);
 }
 
+// ── Own-diff gates (run even under --no-verify) ──────────────
+//
+// `--no-verify` is meant to skip the repo's pre-commit HOOK SUITE (husky,
+// lint-staged, etc.) — NOT to let a committer skip validation of their OWN
+// diff. The single biggest cause of broken code reaching a shared branch is
+// "--no-verify laundering": an agent passes --no-verify to dodge an
+// unrelated hook failure (e.g. a peer's untracked stray tripping a
+// check-missing hook) and thereby ALSO skips lint/typecheck on the very
+// files it is committing. This gate closes that hole: whenever a repo
+// configures an own-diff gate, git-atomic-commit runs it against the exact
+// `-f` file list on EVERY commit, regardless of --no-verify.
+//
+// The gate is intentionally repo-owned — the tool stays generic and knows
+// nothing about any particular repo's lint/typecheck layout. A repo opts in
+// by either:
+//   • setting GIT_ATOMIC_GATE_CMD to a shell command, or
+//   • providing an executable `.git-atomic-gate` at the repo root.
+// The gate receives the repo-relative file paths both as argv and as the
+// newline-delimited GIT_ATOMIC_FILES env var (the latter is authoritative —
+// it survives paths with spaces), and runs with cwd = repo root. A non-zero
+// exit BLOCKS the commit.
+//
+// Emergency escape: GIT_ATOMIC_SKIP_GATES=1 skips the gate but logs a loud
+// multi-line warning so the bypass is never silent. Repos with no gate
+// configured are entirely unaffected (backward compatible no-op).
+
+const GATE_SCRIPT_FILENAME = '.git-atomic-gate';
+
+/** Truthy for "1"/"true"/"yes" (any case); false for unset/""/"0"/"false"/"no". */
+function isTruthyEnv(value: string | undefined): boolean {
+	if (value == null) return false;
+	const v = value.trim().toLowerCase();
+	return v !== '' && v !== '0' && v !== 'false' && v !== 'no';
+}
+
+type GateCommand =
+	| { kind: 'shell'; command: string }
+	| { kind: 'exec'; path: string };
+
+/**
+ * Resolve the configured own-diff gate for this repo, if any.
+ * GIT_ATOMIC_GATE_CMD wins over the `.git-atomic-gate` file.
+ * Returns null when no gate is configured (backward-compatible no-op).
+ */
+function resolveGateCommand(): GateCommand | null {
+	const envCmd = process.env['GIT_ATOMIC_GATE_CMD'];
+	if (envCmd && envCmd.trim()) {
+		return { kind: 'shell', command: envCmd };
+	}
+	let repoRoot: string;
+	try {
+		repoRoot = getRepoRoot();
+	} catch {
+		return null;
+	}
+	const gatePath = join(repoRoot, GATE_SCRIPT_FILENAME);
+	try {
+		if (existsSync(gatePath) && statSync(gatePath).isFile()) {
+			return { kind: 'exec', path: gatePath };
+		}
+	} catch {
+		return null;
+	}
+	return null;
+}
+
+/**
+ * Run the repo's own-diff gate against `files`. Throws (blocking the commit)
+ * if the gate exits non-zero. No-op when no gate is configured.
+ *
+ * Runs regardless of `--no-verify`: this validates the committer's own diff,
+ * which `--no-verify` was never meant to skip. Set GIT_ATOMIC_SKIP_GATES=1
+ * to bypass in a genuine emergency (logged loudly).
+ */
+function runOwnDiffGates({ files }: { files: string[] }): void {
+	if (isTruthyEnv(process.env['GIT_ATOMIC_SKIP_GATES'])) {
+		logError(
+			'================================================================',
+		);
+		logError('GIT_ATOMIC_SKIP_GATES=1 — SKIPPING own-diff lint/typecheck gate.');
+		logError('Your committed diff is NOT being checked. Emergencies only.');
+		logError(
+			'================================================================',
+		);
+		return;
+	}
+
+	if (files.length === 0) return;
+
+	const gate = resolveGateCommand();
+	if (!gate) return; // repo hasn't opted in — stay out of the way
+
+	log(
+		`Running own-diff gate on ${files.length} file(s) (runs even under --no-verify)...`,
+	);
+
+	const repoRoot = getRepoRoot();
+	const gateEnv = {
+		...process.env,
+		GIT_ATOMIC_COMMIT: '1',
+		// Authoritative, space-safe channel for the file list. argv is also
+		// provided for convenience but GIT_ATOMIC_FILES should be preferred.
+		GIT_ATOMIC_FILES: files.join('\n'),
+	};
+
+	const result =
+		gate.kind === 'shell'
+			? // Shell command: run verbatim. Files are passed ONLY via
+				// GIT_ATOMIC_FILES — appending them as shell argv would splice
+				// raw paths into the command string (past any redirects/pipes)
+				// and corrupt it. The env var is the authoritative channel.
+				spawnSync(gate.command, [], {
+					cwd: repoRoot,
+					stdio: 'inherit',
+					env: gateEnv,
+					shell: true,
+				})
+			: // Executable file: argv is safe (no shell interpolation), so pass
+				// the file list directly as arguments in addition to the env var.
+				spawnSync(gate.path, files, {
+					cwd: repoRoot,
+					stdio: 'inherit',
+					env: gateEnv,
+				});
+
+	if (result.error) {
+		throw new Error(
+			`Own-diff gate could not be executed: ${result.error.message}. ` +
+				`(Set GIT_ATOMIC_SKIP_GATES=1 to bypass in an emergency.)`,
+		);
+	}
+	if (result.status !== 0) {
+		const how = result.signal
+			? `signal ${result.signal}`
+			: `exit code ${result.status}`;
+		throw new Error(
+			`Own-diff gate failed (${how}) — commit blocked. Fix the reported ` +
+				`lint/type errors in the file(s) you are committing, or set ` +
+				`GIT_ATOMIC_SKIP_GATES=1 to bypass in a genuine emergency ` +
+				`(the bypass is logged loudly).`,
+		);
+	}
+	log('Own-diff gate passed.');
+}
+
 // ── Critical-section mutex (process-bound, for index-mutating phase) ─
 
 /**
@@ -1071,6 +1216,13 @@ program
 		const ttl = parseTtl(opts.ttl);
 		const waitSeconds = parseWait(opts.wait);
 		validateLiteralFileInputs({ paths: files });
+
+		// Own-diff gate: validate the committer's OWN files (scoped
+		// lint/typecheck, defined by the repo) BEFORE touching the lock or
+		// the index. Runs regardless of --no-verify — see runOwnDiffGates.
+		// Placed here so a gate failure fast-fails with zero lock churn and
+		// nothing left staged. No-op for repos that don't configure a gate.
+		runOwnDiffGates({ files });
 
 		// Check if we already hold the lock (from a prior `lock` command)
 		const existing = readLock();
