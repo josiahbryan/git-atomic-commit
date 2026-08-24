@@ -1705,5 +1705,129 @@ describe('git-atomic-commit', () => {
 			expect(treeFiles).toContain('new/fü.ts');
 			expect(treeFiles).toContain('öld/fü.ts');
 		});
+
+		test('refuses to silently drop a -f path whose staged deletion is replaced by NEW on-disk content', () => {
+			// QA VARIANT B. `git rm impl.ts` stages a D and removes it from
+			// disk; a NEW file is then written at the SAME path and named on
+			// -f. There is no rename pair, so the rename-aware guard cannot
+			// fire, and the exclusion filter read the replacement as an
+			// intentional `git rm --cached`: the commit recorded a DELETION of
+			// the very path the caller asked to commit, the replacement was
+			// left untracked, and the run exited 0.
+			createFile('impl.ts', 'export const v = 1;\n');
+			gitCmd('add', 'impl.ts');
+			gitCmd('commit', '-m', 'add impl', '--no-verify');
+			const base = gitCmd('rev-parse', 'HEAD');
+
+			gitCmd('rm', '--quiet', 'impl.ts');
+			createFile('impl.ts', 'export const v = 2; // rewritten\n');
+
+			const result = gac('commit -f impl.ts -m "test: replace impl" --no-verify');
+
+			// THE WITNESS: no commit may land that omits the named path's
+			// on-disk content while reporting success.
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('impl.ts');
+			expect(gitCmd('rev-parse', 'HEAD')).toBe(base);
+			// The caller's content is untouched on disk — we refuse, we do not destroy.
+			expect(readFileSync(join(tmpRepo, 'impl.ts'), 'utf-8')).toContain('v = 2');
+		});
+
+		test('refuses to silently drop a -f path when a move rewrote the file below git\u2019s rename threshold', () => {
+			// QA VARIANT A. Move a file AND rewrite it past the similarity
+			// threshold, plus a shim at the old path. git reports
+			// [A new/foo.ts, D old/foo.ts] with NO R pair, so
+			// isStagedRenameSource is false and the old path was dropped —
+			// exactly as before the rename fix. Move-and-rewrite in one commit
+			// is a more common refactor than a 100% rename.
+			mkdirSync(join(tmpRepo, 'old'), { recursive: true });
+			createFile('old/foo.ts', 'export const alpha = 1;\n');
+			gitCmd('add', 'old/foo.ts');
+			gitCmd('commit', '-m', 'add old/foo.ts', '--no-verify');
+			const base = gitCmd('rev-parse', 'HEAD');
+
+			mkdirSync(join(tmpRepo, 'new'), { recursive: true });
+			gitCmd('rm', '--quiet', 'old/foo.ts');
+			createFile(
+				'new/foo.ts',
+				'export function totallyDifferent() { return "not one line in common"; }\n',
+			);
+			gitCmd('add', 'new/foo.ts');
+			// `git rm` took the now-empty `old/` directory with it.
+			mkdirSync(join(tmpRepo, 'old'), { recursive: true });
+			createFile('old/foo.ts', "export * from '../new/foo.ts';\n");
+
+			const result = gac(
+				'commit -f old/foo.ts new/foo.ts -m "test: move + rewrite + shim" --no-verify',
+			);
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('old/foo.ts');
+			expect(gitCmd('rev-parse', 'HEAD')).toBe(base);
+		});
+
+		test('stage refuses the same silent drop — the filter has TWO call sites', () => {
+			createFile('impl.ts', 'export const v = 1;\n');
+			gitCmd('add', 'impl.ts');
+			gitCmd('commit', '-m', 'add impl', '--no-verify');
+			gitCmd('rm', '--quiet', 'impl.ts');
+			createFile('impl.ts', 'export const v = 2;\n');
+
+			const result = gac('stage -f impl.ts');
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('impl.ts');
+		});
+
+		test('--allow-dropped-files opts back in to the skip', () => {
+			// The escape hatch keeps the ambiguous-but-legitimate workflow
+			// reachable: untrack a path deliberately while its on-disk content
+			// has moved on. Opt-in, never the default.
+			createFile('impl.ts', 'export const v = 1;\n');
+			gitCmd('add', 'impl.ts');
+			gitCmd('commit', '-m', 'add impl', '--no-verify');
+			gitCmd('rm', '--quiet', 'impl.ts');
+			createFile('impl.ts', 'export const v = 2;\n');
+
+			const result = gac(
+				'commit -f impl.ts -m "test: intentional untrack" --no-verify --allow-dropped-files',
+			);
+
+			expect(result.exitCode).toBe(0);
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only')
+				.split('\n')
+				.filter(Boolean);
+			expect(treeFiles).not.toContain('impl.ts');
+		});
+
+		test('does not FALSELY refuse a genuine git rm --cached when invoked from a SUBDIRECTORY', () => {
+			// The refusal guard compares the working-tree file against HEAD.
+			// `git ls-tree` is given a `:(top,literal)` pathspec so it is
+			// repo-root-relative, but `git hash-object` takes a FILESYSTEM
+			// path and resolves it against CWD — so a repo-relative path
+			// handed to it from a subdirectory does not exist, the comparison
+			// throws, and the conservative `catch` reports "content differs"
+			// for a file that is byte-identical. A hard block on a legitimate
+			// workflow, in the direction the guard is least likely to be
+			// suspected of.
+			//
+			// Every other fixture in this file runs from the repo root, so the
+			// suite was structurally incapable of catching this.
+			mkdirSync(join(tmpRepo, 'sub'), { recursive: true });
+			createFile('sub/gone.txt', 'keep locally\n');
+			gitCmd('add', 'sub/gone.txt');
+			gitCmd('commit', '-m', 'add sub/gone.txt', '--no-verify');
+			gitCmd('rm', '--cached', 'sub/gone.txt');
+
+			const result = gac('commit -f gone.txt -m "test: untrack from subdir" --no-verify', {
+				cwd: join(tmpRepo, 'sub'),
+			});
+
+			expect(result.stdout + result.stderr).not.toContain('Refusing to run');
+			expect(result.exitCode).toBe(0);
+			expect(
+				gitCmd('ls-tree', '-r', 'HEAD', '--name-only').split('\n').filter(Boolean),
+			).not.toContain('sub/gone.txt');
+		});
 	});
 });

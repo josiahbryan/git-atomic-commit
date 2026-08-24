@@ -10,6 +10,7 @@ import {
 	rmSync,
 	existsSync,
 	lstatSync,
+	readlinkSync,
 	openSync,
 	closeSync,
 	statSync,
@@ -950,6 +951,127 @@ function pathsSafeForPlainGitAdd({ paths }: { paths: string[] }): string[] {
 	return paths.filter((p) => !fileWouldReviveStagedDeletion({ relativePath: p }));
 }
 
+/**
+ * True when the working-tree file at `relativePath` is identical to the
+ * blob recorded at HEAD.
+ *
+ * This is the discriminator between the two shapes that
+ * `fileWouldReviveStagedDeletion` cannot otherwise tell apart, because git
+ * reports a bare `D` for BOTH of them:
+ *
+ *   - a deliberate `git rm --cached` — the file on disk is UNCHANGED, so
+ *     skipping `git add` discards nothing and the caller's named path is
+ *     still represented in the commit (as a deletion); versus
+ *   - a staged deletion whose path now holds NEW content — a `git rm`
+ *     plus a rewrite, or a move that fell below git's rename-similarity
+ *     threshold with a shim left at the old path — where skipping
+ *     `git add` silently drops content the caller named on `--files`.
+ *
+ * Conservative on every error: if we cannot PROVE the skip is lossless we
+ * report that it is not, so the caller is told rather than quietly handed
+ * a partial commit (BDL-2679).
+ */
+function workingTreeMatchesHead({
+	relativePath,
+}: {
+	relativePath: string;
+}): boolean {
+	try {
+		// Read HEAD's entry directly. `git diff HEAD -- <path>` is NOT usable
+		// here: the path is staged as a deletion by construction, so it has
+		// no index entry, so git treats it as UNTRACKED and reports a
+		// deletion for every such path — including the ones that are
+		// byte-identical on disk.
+		const entry = git(
+			'ls-tree',
+			'HEAD',
+			'--',
+			toLiteralPathspec({ relativePath }),
+		).trim();
+		const parsed = entry.match(/^(\d{6}) blob ([0-9a-f]+)\t/);
+		if (!parsed) return false;
+		const [, headMode, headBlob] = parsed;
+
+		// `resolve` against the repo root, matching
+		// `pathExistsIncludingBrokenSymlink`. This is NOT cosmetic: the
+		// pathspec above carries `:(top)` so it is repo-root-relative, but
+		// `git hash-object` takes a FILESYSTEM path and resolves it against
+		// CWD. Handing it a repo-relative path from a subdirectory makes it
+		// throw, and the conservative `catch` then reports "differs" for a
+		// byte-identical file — a hard refusal of a legitimate
+		// `git rm --cached`, in the one direction a guard is least likely
+		// to be suspected of.
+		const absolute = resolve(getRepoRoot(), relativePath);
+		const isSymlink = lstatSync(absolute).isSymbolicLink();
+		if (isSymlink !== (headMode === '120000')) return false;
+
+		// Symlinks must be compared by TARGET, not by dereferenced content:
+		// `git hash-object` follows the link, so it throws on a dangling one
+		// and would refuse the legitimate `git rm --cached` of a broken
+		// symlink. git records the target string as the blob.
+		if (isSymlink) {
+			return readlinkSync(absolute) === git('cat-file', 'blob', headBlob);
+		}
+
+		// `--path` declares the path whose .gitattributes decide the clean
+		// filter / eol conversion, so this compares like-for-like with the
+		// blob git recorded. Deliberately NO file-mode comparison: under
+		// `core.fileMode=false` git ignores the exec bit, and comparing it
+		// would manufacture a false refusal on exactly the checkouts that
+		// cannot represent it.
+		return (
+			git('hash-object', '--path', relativePath, '--', absolute).trim() === headBlob
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Refuse the operation when a path named on `--files` would be excluded
+ * from `git add` AND that exclusion would discard the content sitting on
+ * disk.
+ *
+ * `--files` is an instruction, not a hint. Doing less than the caller
+ * asked, on a path they typed by hand, must be an ERROR and not a log
+ * line — Josiah's standing rule of 2026-08-15, quoted by BDL-2679's own
+ * acceptance criteria: an unusable instruction is an error, never a
+ * no-op.
+ *
+ * We refuse rather than guess. Once the on-disk content differs from
+ * HEAD, "revive this path" and "record the deletion and leave my edit
+ * alone" are both defensible readings of the same index state, and
+ * picking one silently is how the partial-commit arm of BDL-2679 shipped
+ * a commit that existed, looked complete, and was not.
+ *
+ * Called BEFORE the lock is acquired and before anything is unstaged, so
+ * a refusal costs zero lock churn and leaves the index exactly as found.
+ */
+function assertNoSilentlyDroppedFiles({
+	files,
+	allowDroppedFiles,
+}: {
+	files: string[];
+	allowDroppedFiles: boolean;
+}): void {
+	if (allowDroppedFiles) return;
+
+	const toStage = pathsSafeForPlainGitAdd({ paths: files });
+	const dropped = files.filter(
+		(f) => !toStage.includes(f) && !workingTreeMatchesHead({ relativePath: f }),
+	);
+	if (dropped.length === 0) return;
+
+	throw new Error(
+		`Refusing to run: ${dropped.length} path(s) named on --files are staged for deletion ` +
+			`but hold DIFFERENT content on disk, so this would record the deletion and silently ` +
+			`drop what you have on disk: ${dropped.join(', ')}. ` +
+			`Stage the state you intend yourself — \`git add -- <path>\` to keep the on-disk ` +
+			`content, or restore the file to its committed content to keep the deletion — ` +
+			`or pass --allow-dropped-files to skip these paths deliberately.`,
+	);
+}
+
 function stageFiles(files: string[]): void {
 	if (files.length === 0) return;
 
@@ -1276,6 +1398,10 @@ program
 	)
 	.option('--no-verify', 'Skip pre-commit hooks')
 	.option(
+		'--allow-dropped-files',
+		'Permit --files paths staged for deletion to be skipped even when the on-disk file holds different content (default: refuse)',
+	)
+	.option(
 		'-w, --wait <seconds>',
 		'Poll for the lock up to this many seconds before failing (default: 0, fail immediately)',
 		'0',
@@ -1286,6 +1412,15 @@ program
 		const ttl = parseTtl(opts.ttl);
 		const waitSeconds = parseWait(opts.wait);
 		validateLiteralFileInputs({ paths: files });
+
+		// Cheapest gate first: refuse a --files path whose staged deletion
+		// would silently swallow different on-disk content. Before the
+		// own-diff gate and before the lock, so a refusal burns no
+		// lint/typecheck run and touches no shared state (BDL-2679).
+		assertNoSilentlyDroppedFiles({
+			files,
+			allowDroppedFiles: Boolean(opts.allowDroppedFiles),
+		});
 
 		// Own-diff gate: validate the committer's OWN files (scoped
 		// lint/typecheck, defined by the repo) BEFORE touching the lock or
@@ -1544,6 +1679,10 @@ program
 	.description('Stage files while holding a multi-turn transaction lock')
 	.requiredOption('-f, --files <files...>', 'Files to stage')
 	.option(
+		'--allow-dropped-files',
+		'Permit --files paths staged for deletion to be skipped even when the on-disk file holds different content (default: refuse)',
+	)
+	.option(
 		'-o, --owner <owner>',
 		'Lock owner identifier',
 		`pid-${process.pid}`,
@@ -1564,6 +1703,13 @@ program
 		const ttl = parseTtl(opts.ttl);
 		const waitSeconds = parseWait(opts.wait);
 		validateLiteralFileInputs({ paths: files });
+
+		// Same refusal as `commit` — the exclusion filter has TWO call
+		// sites and the silent-drop shape is identical at both (BDL-2679).
+		assertNoSilentlyDroppedFiles({
+			files,
+			allowDroppedFiles: Boolean(opts.allowDroppedFiles),
+		});
 
 		const existing = readLock();
 		const usingExisting = Boolean(existing && existing.owner === owner && !isStale(existing));

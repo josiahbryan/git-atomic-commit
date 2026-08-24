@@ -64,7 +64,35 @@ No manual cleanup needed. Fix the issue and re-run.
 -t, --ttl <seconds>      Lock TTL in seconds (default: 60)
 -w, --wait <seconds>     Poll for the lock up to N seconds before failing (default: 0, fail immediately)
 --no-verify              Skip pre-commit hooks
+--allow-dropped-files    Permit --files paths staged for deletion to be skipped
+                         even when the on-disk file holds different content
+                         (default: refuse — see "Refusing to drop a named file")
 ```
+
+### Refusing to drop a named file
+
+A path staged for deletion whose file is still on disk is normally excluded
+from `git add`, so that a deliberate `git rm --cached` is not undone. git
+reports a bare `D` for that case — and for a *different* one: a path whose
+staged deletion has been replaced by NEW content (`git rm` plus a rewrite, or
+a move that fell below git's rename-similarity threshold with a shim left at
+the old path).
+
+Excluding the second kind silently drops content the caller named by hand, and
+produces the worst failure this tool has: **a commit that exists, looks
+complete, and is not.** So when an excluded path's working-tree content
+differs from the blob recorded at HEAD, the run is **refused** (exit `1`,
+nothing committed, index untouched) rather than logged.
+
+It refuses rather than guesses: once the on-disk content has moved on, "revive
+this path" and "record the deletion, leave my edit alone" are both defensible
+readings of the same index state. Stage the state you intend
+(`git add -- <path>`, or restore the file to its committed content), or pass
+`--allow-dropped-files` to skip the path deliberately.
+
+The genuine `git rm --cached` workflow is unaffected — including for dangling
+symlinks, which are compared by link target rather than by dereferenced
+content.
 
 ### Multi-turn transactions
 
