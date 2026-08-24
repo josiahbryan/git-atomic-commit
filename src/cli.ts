@@ -101,7 +101,7 @@ function jitteredPollMs(): number {
 
 // Env passed to all git subprocesses. GIT_ATOMIC_COMMIT=1 tells
 // git-guardrails (if installed) to allow these calls through.
-const GIT_ENV = { ...process.env, GIT_ATOMIC_COMMIT: '1' };
+const GIT_ENV: NodeJS.ProcessEnv = { ...process.env, GIT_ATOMIC_COMMIT: '1' };
 
 function git(...args: string[]): string {
 	try {
@@ -162,6 +162,169 @@ function getRepoRoot(): string {
 
 function getLockDir(): string {
 	return join(resolve(getGitDir()), LOCK_DIR_NAME);
+}
+
+// ── Private commit index (BDL-2671) ──────────────────────────
+//
+// A bare `git commit` commits WHATEVER `.git/index` CONTAINS AT COMMIT
+// TIME. That made this tool's isolation TEMPORAL — snapshot the index,
+// temp-unstage what isn't ours, and race to commit before anyone else
+// writes it. The exposed window spans staging, the entire pre-commit hook
+// run (measured at 5m24s on a real monorepo) and the commit itself, and
+// `.git/index` is a shared mutable resource that any other process may
+// write: another agent, a husky hook that lints and re-adds, an editor's
+// git integration. None of them know this tool's lock exists, so no
+// amount of locking against OURSELVES can close it.
+//
+// Measured consequence: a foreign agent's staged files were absorbed into
+// somebody else's commit, under somebody else's message, exit 0, with the
+// reassuring "Restoring N previously-staged file(s)" line printed after
+// the capture (a no-op, because the file was already committed).
+//
+// The fix is structural rather than temporal: build the commit in a
+// PRIVATE index seeded from HEAD, so the committed tree is "HEAD plus
+// exactly the declared --files" BY CONSTRUCTION, no matter what any other
+// process does to `.git/index` meanwhile.
+
+function headExists(): boolean {
+	try {
+		execFileSync('git', ['rev-parse', '--verify', '--quiet', 'HEAD'], {
+			stdio: 'pipe',
+			env: GIT_ENV,
+		});
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * True while a merge is in progress. A private index seeded from HEAD
+ * would drop the merge's auto-merged content entirely while still
+ * producing a two-parent commit — a silent, permanent revert that looks
+ * like a healthy merge to `git merge-base --is-ancestor`. Refuse instead.
+ */
+function mergeInProgress(): boolean {
+	return existsSync(join(resolve(getGitDir()), 'MERGE_HEAD'));
+}
+
+/**
+ * Run `run` with every git subprocess pointed at a throwaway index file
+ * seeded from HEAD. The scratch file lives inside `.git` so it shares a
+ * filesystem with the real index (git writes indexes via rename) and can
+ * never appear in `git status`.
+ */
+let activePrivateIndex: { path: string; previous: string | undefined } | null =
+	null;
+
+/**
+ * Tear down the private index if one is active: restore the git env and
+ * delete the scratch file. Idempotent, never throws.
+ *
+ * MUST be called before any cleanup path that writes the index — the
+ * signal handler's `restoreUnrelatedStaging` above all. The override
+ * lives on the module-global git env, so a restore that runs while it is
+ * still installed re-stages the other agent's files into a throwaway
+ * file which is then deleted — destroying the very staging the restore
+ * exists to protect. (Measured: Ctrl+C during a slow pre-commit hook left
+ * the real index empty and leaked the scratch file.)
+ */
+function exitPrivateIndex(): void {
+	const active = activePrivateIndex;
+	if (!active) return;
+	activePrivateIndex = null;
+	if (active.previous === undefined) delete GIT_ENV['GIT_INDEX_FILE'];
+	else GIT_ENV['GIT_INDEX_FILE'] = active.previous;
+	try {
+		rmSync(active.path, { force: true });
+		rmSync(`${active.path}.lock`, { force: true });
+	} catch {
+		// Best effort — a leaked scratch file is inert (it is only ever
+		// read via GIT_INDEX_FILE, which is no longer set).
+	}
+}
+
+function withPrivateIndex<T>({ run }: { run: () => T }): T {
+	const indexPath = join(
+		resolve(getGitDir()),
+		`atomic-commit-index-${process.pid}-${Date.now().toString(36)}`,
+	);
+	activePrivateIndex = {
+		path: indexPath,
+		previous: GIT_ENV['GIT_INDEX_FILE'],
+	};
+	GIT_ENV['GIT_INDEX_FILE'] = indexPath;
+	try {
+		execFileSync(
+			'git',
+			headExists() ? ['read-tree', 'HEAD'] : ['read-tree', '--empty'],
+			{ stdio: 'pipe', env: GIT_ENV },
+		);
+		return run();
+	} finally {
+		exitPrivateIndex();
+	}
+}
+
+/**
+ * Record a deletion for `paths` in the CURRENT index. Needed because the
+ * private index is seeded from HEAD, where a path whose deletion the user
+ * staged (`git rm --cached`, file still on disk) is present again.
+ * `update-index` takes literal file names, not pathspecs.
+ */
+function removeFromIndex({ paths }: { paths: string[] }): void {
+	if (paths.length === 0) return;
+	execFileSync('git', ['update-index', '--force-remove', '--', ...paths], {
+		stdio: 'pipe',
+		env: GIT_ENV,
+	});
+}
+
+/**
+ * AC3: a commit must never contain paths outside its own declared change
+ * set. With a HEAD-seeded private index this holds by construction, so a
+ * violation here means an assumption broke — fail loudly rather than
+ * write the commit. Paths *under* a declared directory are in scope.
+ */
+function assertCommitScopedToDeclaredFiles({ files }: { files: string[] }): void {
+	const staged = git('diff', '--cached', '--name-only', '--no-renames', '-z');
+	const declared = new Set(files);
+	const extra = staged
+		.split('\0')
+		.filter(Boolean)
+		.filter(
+			(p) => !declared.has(p) && !files.some((f) => p.startsWith(`${f}/`)),
+		);
+	if (extra.length > 0) {
+		throw new Error(
+			`Refusing to commit: ${extra.length} path(s) outside the declared ` +
+				`--files set are present in the commit index: ${extra.join(', ')}. ` +
+				`The commit index is built from HEAD plus --files only, so this ` +
+				`should be impossible — please report it.`,
+		);
+	}
+}
+
+/**
+ * Bring the REAL index entries for `paths` up to the new HEAD after a
+ * successful private-index commit — exactly the state a plain
+ * `git commit` leaves behind. Without this the real index still holds the
+ * pre-commit entry for every committed path, which `git status` renders
+ * as a staged reversion. Scoped to the declared paths, so a concurrent
+ * agent's staging of anything else is untouched. Best-effort: the commit
+ * has already succeeded and must not be turned into a failure here.
+ */
+function syncRealIndexToHead({ paths }: { paths: string[] }): void {
+	if (paths.length === 0) return;
+	try {
+		execFileSync(
+			'git',
+			['reset', '-q', 'HEAD', '--', ...toLiteralPathspecs({ paths })],
+			{ stdio: 'pipe', env: GIT_ENV },
+		);
+	} catch {
+		/* best effort — see doc comment */
+	}
 }
 
 // ── Own-diff gates (run even under --no-verify) ──────────────
@@ -1124,6 +1287,9 @@ function installLockCleanupHandlers({
 	const handler = (signal: NodeJS.Signals) => {
 		const messages: string[] = [];
 		try {
+			// FIRST: drop the private-index override, so everything below
+			// (restore, in particular) operates on the REAL index.
+			exitPrivateIndex();
 			const unrelated = getUnrelatedToRestore?.() ?? [];
 			if (unrelated.length > 0) {
 				try {
@@ -1223,6 +1389,22 @@ program
 		// Placed here so a gate failure fast-fails with zero lock churn and
 		// nothing left staged. No-op for repos that don't configure a gate.
 		runOwnDiffGates({ files });
+
+		// A subset commit mid-merge is never safe: the commit index is
+		// built from HEAD plus --files, so the merge's auto-merged content
+		// would be dropped while git still records a two-parent commit —
+		// a silent revert that reads as a healthy merge to every ancestry
+		// check. Let the merge auto-commit, or resolve and
+		// `git merge --continue`. Narrow refusal: only during an actual
+		// merge, never merely because unrelated files are staged.
+		if (mergeInProgress()) {
+			throw new Error(
+				'Refusing to commit a --files subset while a merge is in progress ' +
+					'(MERGE_HEAD exists). The merge has already staged its resolved ' +
+					'files; committing a subset would silently drop the rest. Use ' +
+					'`git commit` / `git merge --continue` to conclude the merge.',
+			);
+		}
 
 		// Check if we already hold the lock (from a prior `lock` command)
 		const existing = readLock();
@@ -1341,17 +1523,31 @@ program
 						`Skipping git add for ${skipped.length} path(s) (staged deletion; on-disk file would re-add to index): ${skipped.join(', ')}`,
 					);
 				}
-				log(`Staging ${toStage.length} file(s): ${toStage.join(', ') || '(none — using existing index)'}`);
-				failingPhase = 'staging';
-				stageFiles(toStage);
+				// Everything from here to the commit runs against a
+				// PRIVATE index seeded from HEAD (see withPrivateIndex).
+				// The shared `.git/index` is not written, so no concurrent
+				// writer can put its staged files into this commit.
+				withPrivateIndex({
+					run: () => {
+						log(`Staging ${toStage.length} file(s): ${toStage.join(', ') || '(none — using existing index)'}`);
+						failingPhase = 'staging';
+						stageFiles(toStage);
+						// Seeded from HEAD, so a staged deletion the caller
+						// asked us to carry has to be re-applied here.
+						removeFromIndex({ paths: skipped });
 
-				const commitArgs = ['commit', '-m', message];
-				if (verify === false) commitArgs.push('--no-verify');
+						assertCommitScopedToDeclaredFiles({ files });
 
-				failingPhase = 'commit';
-				log('Committing...');
-				gitPassthrough(...commitArgs);
+						const commitArgs = ['commit', '-m', message];
+						if (verify === false) commitArgs.push('--no-verify');
+
+						failingPhase = 'commit';
+						log('Committing...');
+						gitPassthrough(...commitArgs);
+					},
+				});
 				log('Commit successful.');
+				syncRealIndexToHead({ paths: files });
 			} catch (err: any) {
 				const hasGitOutput = Boolean(
 					(err?.stdout && String(err.stdout).trim()) ||

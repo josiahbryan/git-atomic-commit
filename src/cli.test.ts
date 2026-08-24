@@ -863,6 +863,94 @@ describe('git-atomic-commit', () => {
 		}, 15000);
 	});
 
+	// ── concurrent foreign index writer (BDL-2671) ───────────
+
+	/**
+	 * BDL-2671: a bare `git commit` commits whatever `.git/index` contains
+	 * AT COMMIT TIME, so the commit's file set is decided by the ambient
+	 * state of a shared mutable resource rather than by the declared
+	 * `--files` set. Any foreign process that writes the index inside the
+	 * commit window (pre-commit hook duration + commit) gets its staged
+	 * work silently absorbed into THIS commit, under THIS message — exit 0,
+	 * "Commit successful.", nothing goes red.
+	 *
+	 * The window is opened DETERMINISTICALLY rather than by sleeping: the
+	 * pre-commit hook signals "window open" via a marker file and blocks
+	 * until the writer signals "done". Marker files live OUTSIDE the repo
+	 * so they never show up in `git status`. The writer is a separate
+	 * process with no `GIT_INDEX_FILE` in its env — i.e. exactly the
+	 * "another agent runs plain git" case from the incident.
+	 */
+	describe('concurrent foreign index writer', () => {
+		/**
+		 * Install a pre-commit hook that holds the commit window open, plus
+		 * a separate process that stages `path` into the real index while
+		 * the window is open. Returns a promise resolving when the writer
+		 * has finished, so tests never leak a background process.
+		 */
+		function armConcurrentWriter({ path }: { path: string }): Promise<void> {
+			const openMarker = join(tmpRepo, '..', 'window-open');
+			const doneMarker = join(tmpRepo, '..', 'writer-done');
+
+			const hookPath = join(tmpRepo, '.git', 'hooks', 'pre-commit');
+			writeFileSync(
+				hookPath,
+				`#!/bin/sh\n` +
+					`touch '${openMarker}'\n` +
+					`i=0\n` +
+					`while [ ! -f '${doneMarker}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n` +
+					`exit 0\n`,
+			);
+			chmodSync(hookPath, 0o755);
+
+			const writer = spawn(
+				'sh',
+				[
+					'-c',
+					`i=0; ` +
+						`while [ ! -f '${openMarker}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; ` +
+						`git add -- '${path}'; ` +
+						`touch '${doneMarker}'`,
+				],
+				{ cwd: tmpRepo, stdio: 'pipe', env: GIT_TEST_ENV },
+			);
+
+			return new Promise<void>((resolve) => writer.on('exit', () => resolve()));
+		}
+
+		test('does not capture a foreign file staged inside the commit window', async () => {
+			createFile('foreign.txt', 'another agent work\n');
+			createFile('mine.txt', 'my work\n');
+			// Another agent's prior staging, exactly as on the shared checkout.
+			gitCmd('add', 'foreign.txt');
+
+			const writerDone = armConcurrentWriter({ path: 'foreign.txt' });
+			const result = gac('commit -f mine.txt -m "test: mine only"');
+			await writerDone;
+
+			expect(result.exitCode).toBe(0);
+			// The declared change set was mine.txt ONLY.
+			expect(filesInHead()).toEqual(['mine.txt']);
+		}, 30000);
+
+		test("leaves the foreign agent's staging intact in the real index", async () => {
+			createFile('foreign.txt', 'another agent work\n');
+			createFile('mine.txt', 'my work\n');
+			gitCmd('add', 'foreign.txt');
+
+			const writerDone = armConcurrentWriter({ path: 'foreign.txt' });
+			gac('commit -f mine.txt -m "test: mine only"');
+			await writerDone;
+
+			// The reassuring "Restoring N previously-staged file(s)" line is
+			// printed in the failing case too — it is a no-op there because
+			// the file has already been committed. Assert the EFFECT.
+			expect(stagedEntries()).toEqual([
+				{ path: 'foreign.txt', status: 'A' },
+			]);
+		}, 30000);
+	});
+
 	// ── lock / unlock ────────────────────────────────────────
 
 	describe('lock', () => {
