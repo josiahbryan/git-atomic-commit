@@ -1580,4 +1580,130 @@ describe('git-atomic-commit', () => {
 			expect(result.stdout).toContain('Running own-diff gate on 1 file');
 		});
 	});
+
+	// ── BDL-2679: no failure path may exit 0 ──────────────────
+	//
+	// Three sites downgraded a real failure into a log line while the
+	// process still exited 0 (or silently did less than it was asked).
+	// Every assertion below is on the WITNESS (the tree, the index, the
+	// message) rather than on the exit code alone, because the defect
+	// under test IS a wrong exit code — asserting only on status is how
+	// this class ships green.
+	describe('BDL-2679: failure paths must not report success', () => {
+		test('commits an explicitly-named -f path that is the SOURCE half of a staged rename', () => {
+			// The production shape (rubber 8173e419ae -> 82bd2b7885, 34s
+			// apart): `git mv old new`, then write a re-export shim back at
+			// the OLD path, then commit both by name. Limited to the old
+			// path, `git diff --cached --name-status` cannot pair the
+			// rename and reports a bare `D`, so the staged-deletion filter
+			// misread the rename source as an intentional `git rm --cached`
+			// and dropped a file the caller named on -f.
+			mkdirSync(join(tmpRepo, 'old'), { recursive: true });
+			createFile('old/foo.ts', 'export const foo = 1;\n');
+			gitCmd('add', 'old/foo.ts');
+			gitCmd('commit', '-m', 'add old/foo.ts', '--no-verify');
+
+			mkdirSync(join(tmpRepo, 'new'), { recursive: true });
+			gitCmd('mv', 'old/foo.ts', 'new/foo.ts');
+			createFile('old/foo.ts', "export * from '../new/foo.ts';\n");
+
+			const result = gac(
+				'commit -f old/foo.ts new/foo.ts -m "test: move + re-export shim" --no-verify',
+			);
+
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only')
+				.split('\n')
+				.filter(Boolean);
+			// THE WITNESS: both named paths are in the commit.
+			expect(treeFiles).toContain('new/foo.ts');
+			expect(treeFiles).toContain('old/foo.ts');
+			expect(gitCmd('show', 'HEAD:old/foo.ts')).toContain(
+				"export * from '../new/foo.ts';",
+			);
+			expect(result.exitCode).toBe(0);
+		});
+
+		test('stage reports the number of files it ACTUALLY staged, not the number requested', () => {
+			// `git rm --cached` case: the path is legitimately excluded from
+			// `git add`, so 1 of 2 requested paths is staged. The summary
+			// line interpolated the REQUESTED count, printing an
+			// affirmatively false success number.
+			createFile('gone.txt', 'keep locally\n');
+			gitCmd('add', 'gone.txt');
+			gitCmd('commit', '-m', 'add gone', '--no-verify');
+			gitCmd('rm', '--cached', 'gone.txt');
+			createFile('kept.txt', 'new file\n');
+
+			const result = gac('stage -f gone.txt kept.txt');
+
+			expect(result.stdout).toContain('Skipping git add');
+			// THE WITNESS: exactly one path was newly added to the index.
+			expect(stagedFiles()).toContain('kept.txt');
+			expect(result.stdout).not.toContain('Staged 2 file(s)');
+			expect(result.stdout).toContain('Staged 1 file(s)');
+		});
+
+		test('exits NON-ZERO when a peer’s staged file could not be restored after the commit', () => {
+			// Sites A+B: restoreUnrelatedStaging collected per-file failures
+			// into an array, logged "ERROR: Failed to restore prior
+			// staging...", and returned void; the caller's catch never set
+			// commitFailed, so the run fell through the exit gate at 0.
+			// The thing not restored is ANOTHER AGENT'S staged work.
+			createFile('unrelated.txt', 'v1\n');
+			createFile('mine.txt', 'mine v1\n');
+			gitCmd('add', 'unrelated.txt', 'mine.txt');
+			gitCmd('commit', '-m', 'base', '--no-verify');
+
+			// A peer stages in-flight work.
+			createFile('unrelated.txt', 'peer in-flight edit\n');
+			gitCmd('add', 'unrelated.txt');
+			expect(stagedFiles()).toContain('unrelated.txt');
+
+			// Stand-in for a concurrent git process holding index.lock
+			// during the restore window: a post-commit hook that creates it.
+			const hookPath = join(tmpRepo, '.git', 'hooks', 'post-commit');
+			writeFileSync(
+				hookPath,
+				['#!/bin/sh', 'touch "$(git rev-parse --git-dir)/index.lock"', ''].join(
+					'\n',
+				),
+			);
+			chmodSync(hookPath, 0o755);
+
+			createFile('mine.txt', 'mine v2\n');
+			const result = gac('commit -f mine.txt -m "test: my own commit" --no-verify');
+
+			// THE WITNESS: the commit landed, and the peer's staging did not
+			// come back. Both facts must be visible to a caller.
+			expect(gitCmd('log', '--format=%s', '-n', '1')).toBe('test: my own commit');
+			expect(result.stdout + result.stderr).toContain(
+				'Failed to restore prior staging',
+			);
+			expect(result.exitCode).not.toBe(0);
+		});
+
+		test('handles a rename whose OLD path contains non-ASCII characters', () => {
+			// `git diff --name-status` C-quotes such paths by default
+			// (core.quotePath), so a newline-split comparison against the
+			// raw path silently never matches — and the path is dropped
+			// again, for exactly the files least likely to be noticed.
+			// `-z` emits raw NUL-delimited fields instead.
+			mkdirSync(join(tmpRepo, 'öld'), { recursive: true });
+			createFile('öld/fü.ts', 'export const foo = 1;\n');
+			gitCmd('add', 'öld/fü.ts');
+			gitCmd('commit', '-m', 'add unicode path', '--no-verify');
+
+			mkdirSync(join(tmpRepo, 'new'), { recursive: true });
+			gitCmd('mv', 'öld/fü.ts', 'new/fü.ts');
+			createFile('öld/fü.ts', "export * from '../new/fü.ts';\n");
+
+			gac('commit -f öld/fü.ts new/fü.ts -m "test: unicode move + shim" --no-verify');
+
+			const treeFiles = gitCmd('ls-tree', '-r', 'HEAD', '--name-only', '-z')
+				.split('\0')
+				.filter(Boolean);
+			expect(treeFiles).toContain('new/fü.ts');
+			expect(treeFiles).toContain('öld/fü.ts');
+		});
+	});
 });

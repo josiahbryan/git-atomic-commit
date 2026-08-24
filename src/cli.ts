@@ -52,6 +52,26 @@ class LockHeldError extends Error {
 
 const PREFIX = '[git-atomic-commit]';
 
+/**
+ * Exit code for "the commit LANDED, but we damaged third-party state we
+ * could not put back" — currently: another agent's staged index entries
+ * that `restoreUnrelatedStaging` failed to restore.
+ *
+ * It is deliberately DISTINCT from 1 (`safeAction` / `commitFailed`,
+ * meaning nothing was committed). A single non-zero status conflates two
+ * facts a caller must act on differently:
+ *
+ *   exit 1 -> nothing was committed. Do not push. Retrying is safe.
+ *   exit 3 -> the commit EXISTS. Retrying would double-commit; the sha is
+ *             on the `[<branch> <sha>]` line and repeated on the
+ *             `GIT_ATOMIC_RESULT=` line, so a caller that knows to look
+ *             can still push and then repair the damaged index.
+ *
+ * Exiting 0 here — the pre-BDL-2679 behaviour — made a destroyed peer
+ * index byte-identical to success at the only place a script looks.
+ */
+const EXIT_COMMITTED_WITH_DAMAGE = 3;
+
 function log(msg: string) {
 	console.log(`${PREFIX} ${msg}`);
 }
@@ -598,13 +618,19 @@ function temporarilyUnstageUnrelated({
  *     this loses partial-hunk selections (which is why the commit action
  *     refuses to proceed when those are detected — see
  *     `findPartiallyStagedUnrelated`).
+ *
+ * Returns the paths it could NOT restore. It used to collect them into a
+ * local array, log an ERROR and return `void`, leaving the caller nothing
+ * to branch on — the failure was visible to a human reading stderr and
+ * invisible to every automated caller (BDL-2679). Callers MUST propagate
+ * a non-empty result; see `EXIT_COMMITTED_WITH_DAMAGE`.
  */
 function restoreUnrelatedStaging({
 	unrelated,
 }: {
 	unrelated: PriorStagedEntry[];
-}): void {
-	if (unrelated.length === 0) return;
+}): string[] {
+	if (unrelated.length === 0) return [];
 
 	const failures: string[] = [];
 	const reAppliedDeletes: string[] = [];
@@ -686,6 +712,8 @@ function restoreUnrelatedStaging({
 			);
 		}
 	}
+
+	return failures;
 }
 
 /**
@@ -865,6 +893,44 @@ function isStagedDeletion({
 	return line.startsWith('D');
 }
 
+/**
+ * True when `relativePath` is staged as the SOURCE half of a rename —
+ * i.e. `git diff --cached --name-status` over the WHOLE index reports
+ * `R<score>\t<relativePath>\t<newPath>`.
+ *
+ * Rename detection needs to see BOTH halves of the pair, so it cannot
+ * survive a pathspec limited to the old path: git degrades the pair to a
+ * bare `D`. That degradation is precisely what made
+ * `fileWouldReviveStagedDeletion` misread a `git mv` as an intentional
+ * `git rm --cached` and silently drop an explicitly-named `--files` path
+ * from the commit (BDL-2679).
+ */
+function isStagedRenameSource({
+	relativePath,
+}: {
+	relativePath: string;
+}): boolean {
+	// No pathspec: rename detection needs both halves in the same diff.
+	// `-z` is load-bearing, not tidiness — without it git C-quotes paths
+	// containing non-ASCII or special characters, so the comparison below
+	// would silently never match and the path would fall back to being
+	// treated as an intentional deletion (i.e. dropped again, for exactly
+	// the files least likely to be noticed).
+	const staged = git('diff', '--cached', '--name-status', '-M', '-z');
+	const fields = staged.split('\0');
+	let i = 0;
+	while (i < fields.length) {
+		const status = fields[i];
+		if (!status) break;
+		// R and C are the only statuses that carry TWO path fields.
+		const isPair = status.startsWith('R') || status.startsWith('C');
+		const source = fields[i + 1];
+		if (status.startsWith('R') && source === relativePath) return true;
+		i += isPair ? 3 : 2;
+	}
+	return false;
+}
+
 function fileWouldReviveStagedDeletion({
 	relativePath,
 }: {
@@ -872,7 +938,11 @@ function fileWouldReviveStagedDeletion({
 }): boolean {
 	return (
 		isStagedDeletion({ relativePath }) &&
-		pathExistsIncludingBrokenSymlink({ relativePath })
+		pathExistsIncludingBrokenSymlink({ relativePath }) &&
+		// A rename source is NOT an intentional staged deletion. Skipping
+		// it drops a path the caller named by hand; `--files` is an
+		// instruction, not a hint.
+		!isStagedRenameSource({ relativePath })
 	);
 }
 
@@ -1258,6 +1328,8 @@ program
 		// so the lock is always released (if we acquired it) and
 		// any temporarily-unstaged files are restored on any failure.
 		let commitFailed = false;
+		/** Peer staged entries we could not put back. See EXIT_COMMITTED_WITH_DAMAGE. */
+		const unrestoredPaths: string[] = [];
 		let failingPhase: 'staging' | 'commit' = 'staging';
 		try {
 			// Acquire the process-bound critical-section mutex BEFORE
@@ -1385,11 +1457,18 @@ program
 					`Restoring ${unrelatedToRestore.length} previously-staged file(s): ${unrelatedToRestore.map((e) => e.path).join(', ')}`,
 				);
 				try {
-					restoreUnrelatedStaging({ unrelated: unrelatedToRestore });
+					// A non-empty return means a peer's staged entries did
+					// NOT come back. Record it — logging alone left the
+					// process exiting 0 (BDL-2679).
+					unrestoredPaths.push(
+						...restoreUnrelatedStaging({ unrelated: unrelatedToRestore }),
+					);
 				} catch (err: any) {
 					logError(
 						`Failed to restore prior staged files: ${err?.message ?? String(err)}`,
 					);
+					// A throw here means NONE of them were restored.
+					unrestoredPaths.push(...unrelatedToRestore.map((e) => e.path));
 				}
 				unrelatedToRestore = [];
 			}
@@ -1435,6 +1514,27 @@ program
 			}
 		}
 		if (commitFailed) process.exit(1);
+
+		// The commit LANDED but we could not restore a peer's staged
+		// entries. Exit non-zero so no caller reads this as a clean
+		// success, but with a DISTINCT code, and after re-emitting the sha
+		// above, so a caller can still tell the commit exists and must be
+		// pushed rather than retried. See EXIT_COMMITTED_WITH_DAMAGE.
+		if (unrestoredPaths.length > 0) {
+			let sha = '';
+			try {
+				sha = git('rev-parse', 'HEAD');
+			} catch {
+				// noop — the machine-readable line still names the damage.
+			}
+			console.log(
+				`GIT_ATOMIC_RESULT=committed-with-restore-failure sha=${sha} unrestored=${unrestoredPaths.join(',')}`,
+			);
+			logError(
+				`Commit ${sha || 'HEAD'} LANDED, but ${unrestoredPaths.length} previously-staged file(s) belonging to another process could not be restored: ${unrestoredPaths.join(', ')}. Do NOT retry this commit (it exists); re-stage those paths, then push.`,
+			);
+			process.exit(EXIT_COMMITTED_WITH_DAMAGE);
+		}
 	}));
 
 // ── stage ────────────────────────────────────────────────────
@@ -1486,7 +1586,10 @@ program
 			}
 			log(`Staging ${toStage.length} file(s): ${toStage.join(', ') || '(none — using existing index)'}`);
 			stageFiles(toStage);
-			log(`Staged ${files.length} file(s). Lock remains held.`);
+			// `toStage.length`, not `files.length`: paths excluded above were
+			// never staged, and reporting the REQUESTED count printed an
+			// affirmatively false success number (BDL-2679).
+			log(`Staged ${toStage.length} file(s). Lock remains held.`);
 		} catch (err) {
 			if (!usingExisting) {
 				releaseLock();

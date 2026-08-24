@@ -182,6 +182,29 @@ The lock lives inside `.git/`, so different repos have independent locks. The lo
 | `status` | Show current lock state |
 | `break-lock` | Force-remove a stuck lock |
 
+## Exit codes
+
+Every failure path exits non-zero. Callers that branch on status can rely
+on this — an `ERROR:` line is never accompanied by a zero exit.
+
+| Code | Meaning | What a caller should do |
+|------|---------|-------------------------|
+| `0` | Success. The commit landed and the index was left as found. | Proceed (e.g. push). |
+| `1` | Failure. **Nothing was committed** — the staging was rolled back. | Do not push. Retrying is safe. |
+| `3` | The commit **LANDED**, but previously-staged files belonging to another process could not be restored. | Do **not** retry (the commit exists — retrying double-commits). Push it, then re-stage the paths named on the `GIT_ATOMIC_RESULT=` line. |
+| `128+N` | Terminated by signal N. | Same as `1` — no commit. |
+
+Exit `3` also prints a machine-readable line to stdout:
+
+```
+GIT_ATOMIC_RESULT=committed-with-restore-failure sha=<full-sha> unrestored=<comma-separated paths>
+```
+
+A single non-zero status cannot express the difference between "your
+commit did not happen" and "your commit happened but we damaged a third
+party's index", and those demand opposite responses from a caller — hence
+the distinct code rather than a blanket `exit 1`.
+
 ## Recommended: Pair with git-guardrails
 
 [git-guardrails](https://github.com/josiahbryan/git-guardrails) is a companion tool that blocks dangerous git operations (`git stash`, `git reset --hard`, `git checkout .`, etc.) from AI agents and scripts. When git-guardrails detects that git-atomic-commit is installed, it automatically enforces its usage — blocking raw `git add` + `git commit` and requiring agents to use `git-atomic-commit` instead.
