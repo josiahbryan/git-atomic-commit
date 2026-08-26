@@ -292,12 +292,28 @@ function withPrivateIndex<T>({ run }: { run: () => T }): T {
  * private index is seeded from HEAD, where a path whose deletion the user
  * staged (`git rm --cached`, file still on disk) is present again.
  * `update-index` takes literal file names, not pathspecs.
+ *
+ * 🔴 THEREFORE IT MUST RUN FROM THE REPO ROOT. `paths` here are already
+ * repo-root-relative (normalised upstream), but `update-index` resolves a
+ * literal name against the PROCESS CWD — it accepts no `:(top)` magic to
+ * anchor it. Invoked from a subdirectory, `sub/gone.txt` is read as
+ * `sub/sub/gone.txt`, matches nothing, and `--force-remove` makes that a
+ * SILENT no-op rather than an error. The staged deletion then never reaches
+ * the private index, `git commit` finds nothing to commit, and the whole
+ * atomic commit fails with "nothing to commit, working tree clean" — a
+ * failure that names neither this function nor the subdirectory.
+ *
+ * Measured: `commit -f gone.txt` from `sub/` after `git rm --cached
+ * sub/gone.txt` exited 1 with an empty commit; the same command from the
+ * repo root exited 0. Pinned by "does not FALSELY refuse a genuine
+ * git rm --cached when invoked from a SUBDIRECTORY".
  */
 function removeFromIndex({ paths }: { paths: string[] }): void {
 	if (paths.length === 0) return;
 	execFileSync('git', ['update-index', '--force-remove', '--', ...paths], {
 		stdio: 'pipe',
 		env: GIT_ENV,
+		cwd: getRepoRoot(),
 	});
 }
 
