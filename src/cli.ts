@@ -347,10 +347,59 @@ function assertCommitScopedToDeclaredFiles({ files }: { files: string[] }): void
  * successful private-index commit — exactly the state a plain
  * `git commit` leaves behind. Without this the real index still holds the
  * pre-commit entry for every committed path, which `git status` renders
- * as a staged reversion. Scoped to the declared paths, so a concurrent
- * agent's staging of anything else is untouched. Best-effort: the commit
- * has already succeeded and must not be turned into a failure here.
+ * as a staged reversion. Scoped to the paths this commit actually
+ * contains, so a concurrent agent's staging of anything else is
+ * untouched. Best-effort: the commit has already succeeded and must not
+ * be turned into a failure here.
  */
+/**
+ * Paths carried by the commit at HEAD. A pre-commit hook may stage paths
+ * of its own (rubber's admin-app auto-version-bump is the sanctioned
+ * case); those land in the PRIVATE index, so the real index never learns
+ * about them and is left holding their pre-commit blob — a staged
+ * reversion. They have to be synced too, not just the declared `--files`.
+ * Best-effort: a failure here must not fail an already-successful commit.
+ *
+ * `--root` is load-bearing: without it `diff-tree` has no parent to diff
+ * against on a root commit and prints NOTHING — an empty result that is
+ * indistinguishable from "this commit carried no extra paths".
+ */
+function pathsInHeadCommit(): string[] {
+	try {
+		return git(
+			'diff-tree',
+			'--no-commit-id',
+			'--name-only',
+			'-r',
+			'--root',
+			'-z',
+			'HEAD',
+		)
+			.split('\0')
+			.filter(Boolean);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * The paths whose REAL index entry this commit is responsible for: the
+ * declared `--files` plus anything a pre-commit hook staged of its own
+ * accord, minus any path temp-unstaged from another agent (that entry is
+ * theirs, and the restore in `finally` is what puts it back).
+ */
+function pathsToSyncAfterCommit({
+	files,
+	foreignPaths,
+}: {
+	files: string[];
+	foreignPaths: string[];
+}): string[] {
+	const foreign = new Set(foreignPaths);
+	const committed = pathsInHeadCommit().filter((p) => !foreign.has(p));
+	return [...new Set([...files, ...committed])];
+}
+
 function syncRealIndexToHead({ paths }: { paths: string[] }): void {
 	if (paths.length === 0) return;
 	try {
@@ -1770,7 +1819,12 @@ program
 					},
 				});
 				log('Commit successful.');
-				syncRealIndexToHead({ paths: files });
+				syncRealIndexToHead({
+					paths: pathsToSyncAfterCommit({
+						files,
+						foreignPaths: unrelatedToRestore.map((e) => e.path),
+					}),
+				});
 			} catch (err: any) {
 				const hasGitOutput = Boolean(
 					(err?.stdout && String(err.stdout).trim()) ||

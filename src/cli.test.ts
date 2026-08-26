@@ -951,6 +951,92 @@ describe('git-atomic-commit', () => {
 		}, 30000);
 	});
 
+	// ── pre-commit hook ride-along (BDL-2670 AC4) ────────────
+
+	/**
+	 * A pre-commit hook that stages a file of its own is the ONE sanctioned
+	 * ride-along on the shared checkout (rubber's admin-app auto-version-
+	 * bump). It must keep working, and — the part that is easy to miss — it
+	 * must leave the REAL index clean afterwards.
+	 *
+	 * The private index (BDL-2671) is seeded from HEAD, so a hook's
+	 * `git add` lands in the throwaway index and the real `.git/index`
+	 * never learns about it. After the commit the real index therefore
+	 * still holds the file's PRE-BUMP blob while HEAD holds the new one —
+	 * which `git status` renders as a STAGED REVERSION of the bump. On the
+	 * shared checkout that is the exact failure this ticket exists to stop:
+	 * a staged path blocks every merge on the checkout, and the next
+	 * agent's commit sweeping it re-reverts the bump.
+	 *
+	 * `syncRealIndexToHead` already fixes this for the DECLARED paths; the
+	 * hook's own paths were the gap.
+	 */
+	describe('pre-commit hook ride-along', () => {
+		/** Install a pre-commit hook that rewrites + stages `path`. */
+		function armBumpingHook({
+			path,
+			content,
+		}: {
+			path: string;
+			content: string;
+		}): void {
+			const hookPath = join(tmpRepo, '.git', 'hooks', 'pre-commit');
+			writeFileSync(
+				hookPath,
+				`#!/bin/sh\nprintf '%s' '${content}' > '${path}'\ngit add -- '${path}'\nexit 0\n`,
+			);
+			chmodSync(hookPath, 0o755);
+		}
+
+		test('carries a file staged by the pre-commit hook into the commit', () => {
+			createFile('bump.txt', 'v1\n');
+			gitCmd('add', 'bump.txt');
+			gitCmd('commit', '-m', 'add bump file', '--no-verify');
+
+			armBumpingHook({ path: 'bump.txt', content: 'v2\n' });
+			createFile('mine.txt', 'my work\n');
+
+			const result = gac('commit -f mine.txt -m "test: with hook bump"');
+
+			expect(result.exitCode).toBe(0);
+			expect(filesInHead().sort()).toEqual(['bump.txt', 'mine.txt']);
+		}, 30000);
+
+		test('leaves no staged reversion of the hook-staged file', () => {
+			createFile('bump.txt', 'v1\n');
+			gitCmd('add', 'bump.txt');
+			gitCmd('commit', '-m', 'add bump file', '--no-verify');
+
+			armBumpingHook({ path: 'bump.txt', content: 'v2\n' });
+			createFile('mine.txt', 'my work\n');
+
+			gac('commit -f mine.txt -m "test: with hook bump"');
+
+			// Nothing staged at all: the hook's path was committed, so the
+			// real index must agree with HEAD about it.
+			expect(stagedEntries()).toEqual([]);
+		}, 30000);
+
+		test("does not sync a foreign agent's prior staging away", () => {
+			createFile('bump.txt', 'v1\n');
+			gitCmd('add', 'bump.txt');
+			gitCmd('commit', '-m', 'add bump file', '--no-verify');
+
+			// Another agent's staged work, untouched by this commit.
+			createFile('foreign.txt', 'another agent work\n');
+			gitCmd('add', 'foreign.txt');
+
+			armBumpingHook({ path: 'bump.txt', content: 'v2\n' });
+			createFile('mine.txt', 'my work\n');
+
+			gac('commit -f mine.txt -m "test: with hook bump"');
+
+			expect(stagedEntries()).toEqual([
+				{ path: 'foreign.txt', status: 'A' },
+			]);
+		}, 30000);
+	});
+
 	// ── lock / unlock ────────────────────────────────────────
 
 	describe('lock', () => {
