@@ -7,6 +7,7 @@ import {
 	mkdirSync,
 	writeFileSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	existsSync,
 	lstatSync,
@@ -853,6 +854,12 @@ function temporarilyUnstageUnrelated({
  * to branch on — the failure was visible to a human reading stderr and
  * invisible to every automated caller (BDL-2679). Callers MUST propagate
  * a non-empty result; see `EXIT_COMMITTED_WITH_DAMAGE`.
+ *
+ * Also clears the crash-recovery marker (BC-3492, `writeUnstageRecovery`)
+ * unconditionally: every caller — the normal `finally` block, the signal
+ * handler, and `recoverAbandonedUnstage` — always passes exactly the set
+ * the current marker (if any) describes, so a restore attempt here always
+ * means that marker's job is done, regardless of per-file success.
  */
 function restoreUnrelatedStaging({
 	unrelated,
@@ -942,7 +949,95 @@ function restoreUnrelatedStaging({
 		}
 	}
 
+	clearUnstageRecovery();
 	return failures;
+}
+
+const UNSTAGE_RECOVERY_FILENAME = 'atomic-commit.unstage-recovery.json';
+
+function getUnstageRecoveryPath(): string {
+	return join(resolve(getGitDir()), UNSTAGE_RECOVERY_FILENAME);
+}
+
+/**
+ * Durably record the set of unrelated staged files we are ABOUT TO
+ * temp-unstage, BEFORE calling `temporarilyUnstageUnrelated`. This is the
+ * crash-safety half of the isolation contract (BC-3492):
+ * `restoreUnrelatedStaging` only ever runs from `finally` or a catchable-
+ * signal handler (`installLockCleanupHandlers`, gated on `CLEANUP_SIGNALS`
+ * — SIGINT/SIGTERM/SIGHUP only), and SIGKILL is uncatchable by POSIX/Node —
+ * no code of ours runs at all when it arrives. A process killed between the
+ * unstage and the restore used to leave the victim's files permanently
+ * unstaged with nothing left to recover them. Writing this marker first
+ * means the NEXT `commit` invocation on this repo can detect an abandoned
+ * unstage (see `recoverAbandonedUnstage`) and finish the restore a killed
+ * predecessor never got to run, regardless of which signal — or none at
+ * all — ended it.
+ *
+ * Written via write-then-rename so a crash mid-write can never leave a
+ * half-written, unparsable marker (`rename` is atomic on the same
+ * filesystem; the marker lives inside `.git`, alongside the index and
+ * lock files, for the same reason `withPrivateIndex`'s scratch file does).
+ */
+function writeUnstageRecovery({
+	unrelated,
+}: {
+	unrelated: PriorStagedEntry[];
+}): void {
+	if (unrelated.length === 0) return;
+	const path = getUnstageRecoveryPath();
+	const tmpPath = `${path}.tmp-${process.pid}`;
+	writeFileSync(tmpPath, JSON.stringify(unrelated, null, 2));
+	renameSync(tmpPath, path);
+}
+
+/** Remove the crash-recovery marker. Best-effort, safe to call when absent. */
+function clearUnstageRecovery(): void {
+	try {
+		rmSync(getUnstageRecoveryPath(), { force: true });
+	} catch {
+		// Best effort — a leaked marker is inert; it's just re-read (and
+		// re-cleared) by the next commit's recoverAbandonedUnstage.
+	}
+}
+
+/**
+ * Detect and repair an unstage abandoned by a killed predecessor. Must run
+ * AFTER `enterCriticalSection()`, which is what makes any marker found
+ * here safe to treat as abandoned rather than in-flight: the CS mutex
+ * (with its own staleness takeover) guarantees no other invocation can be
+ * concurrently mid-transaction once we hold it, so a marker that exists at
+ * this point can only be left over from a run that already exited — cleanly
+ * (which would have cleared it) or otherwise.
+ */
+function recoverAbandonedUnstage(): void {
+	const path = getUnstageRecoveryPath();
+	if (!existsSync(path)) return;
+
+	let unrelated: PriorStagedEntry[];
+	try {
+		unrelated = JSON.parse(readFileSync(path, 'utf-8'));
+	} catch {
+		logError(
+			`Found an unreadable crash-recovery marker at ${path} — removing it. ` +
+				`If a prior git-atomic-commit run was killed mid-transaction, check ` +
+				`\`git status\` for files that should be staged but aren't.`,
+		);
+		clearUnstageRecovery();
+		return;
+	}
+
+	log(
+		`Recovering ${unrelated.length} file(s) left unstaged by a killed ` +
+			`git-atomic-commit run: ${unrelated.map((e) => e.path).join(', ')}`,
+	);
+	const failures = restoreUnrelatedStaging({ unrelated });
+	if (failures.length > 0) {
+		logError(
+			`Could not recover ${failures.length} file(s) from the previous killed run: ` +
+				`${failures.join(', ')}. You may need to re-stage them manually.`,
+		);
+	}
 }
 
 /**
@@ -1724,6 +1819,16 @@ program
 			// the critical section." Released in the same finally below.
 			enterCriticalSection();
 
+			// Recover any unrelated staged files left behind by a
+			// predecessor that was killed (SIGKILL) between temp-unstaging
+			// them and restoring them — see `recoverAbandonedUnstage` for
+			// why holding the CS mutex makes any marker found here safe to
+			// treat as abandoned. Runs BEFORE the snapshot below so a
+			// recovered file is captured as this commit's own "unrelated"
+			// state too, and goes through the normal isolate/restore cycle
+			// like any other foreign staged file.
+			recoverAbandonedUnstage();
+
 			// Capture the full prior staging state (path + status code), then
 			// split into "overlap" (also passed via -f, will be committed) and
 			// "unrelated" (must be isolated out so they don't get bundled
@@ -1782,6 +1887,12 @@ program
 				// (e.g. tracked reset succeeded but `rm --cached` of newly-
 				// added files threw) get a best-effort restore from finally.
 				unrelatedToRestore = unrelated;
+				// Durable crash-safety copy (BC-3492) — written BEFORE the
+				// unstage itself runs, so a SIGKILL anywhere from here
+				// through the restore in `finally` still leaves enough on
+				// disk for `recoverAbandonedUnstage` to finish the job on
+				// the next invocation.
+				writeUnstageRecovery({ unrelated });
 				temporarilyUnstageUnrelated({ unrelated });
 			}
 
@@ -1868,7 +1979,11 @@ program
 					logError(
 						`Failed to restore prior staged files: ${err?.message ?? String(err)}`,
 					);
-					// A throw here means NONE of them were restored.
+					// A throw here means NONE of them were restored, and
+					// `restoreUnrelatedStaging` never reached its own
+					// crash-recovery-marker cleanup — so the marker (BC-3492)
+					// survives this throw and a LATER invocation will retry
+					// the recovery automatically, same as a SIGKILL.
 					unrestoredPaths.push(...unrelatedToRestore.map((e) => e.path));
 				}
 				unrelatedToRestore = [];

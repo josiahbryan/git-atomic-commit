@@ -861,6 +861,80 @@ describe('git-atomic-commit', () => {
 				{ path: 'unrelated.txt', status: 'A' },
 			]);
 		}, 15000);
+
+		/**
+		 * BC-3492: SIGKILL is uncatchable by POSIX/Node, so it skips BOTH
+		 * restore paths (the `finally` block AND the signal handler that
+		 * covers SIGINT/SIGTERM/SIGHUP) — unlike the Ctrl+C tests above,
+		 * there is no code that can run synchronously with the kill itself.
+		 * A killed run must instead leave a durable record of what it had
+		 * temporarily unstaged, so the NEXT git-atomic-commit invocation on
+		 * this repo can finish the restore a dead predecessor never got to
+		 * run. `-9` targets the whole detached process group, same as the
+		 * SIGINT tests, so the sleeping hook dies too — matching "session
+		 * teardown killed them" from the original incident, not a graceful
+		 * `kill <pid>` that leaves orphaned hook children running (see the
+		 * reproduce-stage repro notes on this exact pitfall).
+		 */
+		test('SIGKILL during pre-commit hook strands staging, next invocation recovers it', async () => {
+			// Pre-stage an unrelated file (newly added, status A) — the
+			// "other agent's work on the shared checkout" in the incident.
+			createFile('unrelated.txt', 'unrelated content\n');
+			gitCmd('add', 'unrelated.txt');
+			expect(stagedEntries()).toEqual([
+				{ path: 'unrelated.txt', status: 'A' },
+			]);
+
+			createFile('a.txt');
+
+			const hookPath = join(tmpRepo, '.git', 'hooks', 'pre-commit');
+			writeFileSync(hookPath, '#!/bin/sh\nsleep 30\n');
+			chmodSync(hookPath, 0o755);
+
+			const child = spawn(
+				'bun',
+				[CLI, 'commit', '-f', 'a.txt', '-m', 'test: sigkill strands staging'],
+				{ cwd: tmpRepo, detached: true, stdio: 'pipe', env: GIT_TEST_ENV },
+			);
+
+			// Wait for lock acquisition + temp-unstage + entry into the
+			// sleeping hook before killing — same window as the SIGINT
+			// tests above.
+			await new Promise((r) => setTimeout(r, 2500));
+			expect(lockExists()).toBe(true);
+
+			process.kill(-child.pid!, 'SIGKILL');
+
+			await new Promise<void>((resolve) => {
+				child.on('exit', () => resolve());
+			});
+
+			// Immediately after the kill: no code ran to restore it, so
+			// unrelated.txt is stranded — exactly the incident's symptom.
+			expect(stagedEntries()).toEqual([]);
+
+			// A later, unrelated git-atomic-commit invocation on this repo
+			// must recover the stranded file — it should not need to know
+			// anything about the prior killed run. SIGKILL skips both
+			// `releaseLock()` and `exitCriticalSection()` too (same
+			// uncatchable-signal reason), so break the now-orphaned outer
+			// lock and shrink the CS-lock staleness window — exactly what
+			// the CLI's own "Lock held" error message directs an operator
+			// to do; unrelated to the recovery behaviour under test.
+			gac('break-lock');
+			rmSync(hookPath, { force: true });
+			createFile('b.txt');
+			const result = gac(
+				'commit -f b.txt -m "test: second commit recovers stranded staging"',
+				{ env: { GAC_CS_STALE_MS: '1000', GAC_CS_WAIT_MS: '5000' } },
+			);
+
+			expect(result.exitCode).toBe(0);
+			expect(filesInHead()).toEqual(['b.txt']);
+			expect(stagedEntries()).toEqual([
+				{ path: 'unrelated.txt', status: 'A' },
+			]);
+		}, 15000);
 	});
 
 	// ── concurrent foreign index writer (BDL-2671) ───────────
