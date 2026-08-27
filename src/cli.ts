@@ -1395,6 +1395,87 @@ function assertNoSilentlyDroppedFiles({
 	);
 }
 
+/**
+ * True when `relativePath`'s INDEX entry already differs from BOTH HEAD
+ * and the working tree — i.e. someone staged only PART of the on-disk
+ * diff (`git add -p`, or a hand-built partial blob via
+ * `git update-index --cacheinfo`), leaving a further, still-unstaged
+ * edit sitting on top of it.
+ *
+ * Detected the same way `git status` distinguishes "Changes to be
+ * committed" from "Changes not staged for commit": a non-empty
+ * `git diff --cached` (index vs HEAD) AND a non-empty plain `git diff`
+ * (working tree vs index) for the SAME path, at the same time. Both
+ * empty, or only one non-empty, is ordinary — nothing here to protect.
+ *
+ * Deliberately blind to staged deletions: a path with no index entry has
+ * nothing for a plain `git diff` (working tree vs index) to compare
+ * against, so it never matches here — that shape is
+ * `assertNoSilentlyDroppedFiles`'s to catch, not this function's.
+ */
+function isPartiallyStaged({ relativePath }: { relativePath: string }): boolean {
+	const stagedDiff = git(
+		'diff',
+		'--cached',
+		'--name-only',
+		'--',
+		toLiteralPathspec({ relativePath }),
+	);
+	if (!stagedDiff) return false;
+
+	const unstagedDiff = git(
+		'diff',
+		'--name-only',
+		'--',
+		toLiteralPathspec({ relativePath }),
+	);
+	return Boolean(unstagedDiff);
+}
+
+/**
+ * Refuse the operation when a path named on `--files` is PARTIALLY
+ * staged (see `isPartiallyStaged`). `stageFiles` runs a plain
+ * `git add -- <path>` for every present path, which unconditionally
+ * overwrites the index entry with the full working-tree content —
+ * destroying a deliberately partial (hunk-level) stage and silently
+ * folding in whatever else is on disk, which may belong to a different
+ * author entirely (BDL-2882).
+ *
+ * `--files` is an instruction to stage/commit the caller's OWN intended
+ * content, never a license to replace someone else's already-staged
+ * partial state with whatever the working tree currently holds — so
+ * this refuses outright rather than guessing which content to keep,
+ * matching `assertNoSilentlyDroppedFiles`'s stance on an unusable state
+ * (Josiah's 2026-08-15 rule: an unusable instruction/state is an error,
+ * never a silent no-op or a silent guess).
+ *
+ * Called BEFORE the lock is acquired, same placement as
+ * `assertNoSilentlyDroppedFiles`, so a refusal costs zero lock churn.
+ */
+function assertNoPartiallyStagedFiles({
+	files,
+	allowPartialStagingOverwrite,
+}: {
+	files: string[];
+	allowPartialStagingOverwrite: boolean;
+}): void {
+	if (allowPartialStagingOverwrite) return;
+
+	const partial = files.filter((f) => isPartiallyStaged({ relativePath: f }));
+	if (partial.length === 0) return;
+
+	throw new Error(
+		`Refusing to run: ${partial.length} path(s) named on --files are PARTIALLY staged ` +
+			`(the index already holds different content than both HEAD and the working tree), ` +
+			`so this would overwrite the staged content with the full working-tree content — ` +
+			`silently committing whatever else is unstaged on disk, which may belong to a ` +
+			`different author: ${partial.join(', ')}. ` +
+			`Resolve the staged vs. working-tree content yourself first (finish staging your ` +
+			`intended hunks, or stash/restore the extra on-disk changes), or pass ` +
+			`--allow-partial-staging-overwrite to overwrite deliberately.`,
+	);
+}
+
 function stageFiles(files: string[]): void {
 	if (files.length === 0) return;
 
@@ -1728,6 +1809,10 @@ program
 		'Permit --files paths staged for deletion to be skipped even when the on-disk file holds different content (default: refuse)',
 	)
 	.option(
+		'--allow-partial-staging-overwrite',
+		'Permit --files paths that are partially staged (index differs from both HEAD and the working tree) to be overwritten with the full working-tree content (default: refuse)',
+	)
+	.option(
 		'-w, --wait <seconds>',
 		'Poll for the lock up to this many seconds before failing (default: 0, fail immediately)',
 		'0',
@@ -1746,6 +1831,14 @@ program
 		assertNoSilentlyDroppedFiles({
 			files,
 			allowDroppedFiles: Boolean(opts.allowDroppedFiles),
+		});
+
+		// Same placement, same reasoning: refuse a --files path whose
+		// index already holds partial (hunk-level) content that a plain
+		// `git add` would overwrite with the full working tree (BDL-2882).
+		assertNoPartiallyStagedFiles({
+			files,
+			allowPartialStagingOverwrite: Boolean(opts.allowPartialStagingOverwrite),
 		});
 
 		// Own-diff gate: validate the committer's OWN files (scoped
@@ -2064,6 +2157,10 @@ program
 		'Permit --files paths staged for deletion to be skipped even when the on-disk file holds different content (default: refuse)',
 	)
 	.option(
+		'--allow-partial-staging-overwrite',
+		'Permit --files paths that are partially staged (index differs from both HEAD and the working tree) to be overwritten with the full working-tree content (default: refuse)',
+	)
+	.option(
 		'-o, --owner <owner>',
 		'Lock owner identifier',
 		`pid-${process.pid}`,
@@ -2090,6 +2187,13 @@ program
 		assertNoSilentlyDroppedFiles({
 			files,
 			allowDroppedFiles: Boolean(opts.allowDroppedFiles),
+		});
+
+		// Same refusal as `commit` — the partial-staging overwrite is
+		// identical at both call sites (BDL-2882).
+		assertNoPartiallyStagedFiles({
+			files,
+			allowPartialStagingOverwrite: Boolean(opts.allowPartialStagingOverwrite),
 		});
 
 		const existing = readLock();

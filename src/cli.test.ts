@@ -2078,4 +2078,113 @@ describe('git-atomic-commit', () => {
 			).not.toContain('sub/gone.txt');
 		});
 	});
+
+	// ── BDL-2882: partial (hunk-level) staged content must not be
+	// silently overwritten ──────────────────────────────────────
+	//
+	// git-guardrails advertises `stage|commit -f <file>` as "the supported
+	// way to do a partial / explicit-pathspec commit" — true at FILE
+	// granularity, false at HUNK granularity. When a path's index entry
+	// already differs from BOTH HEAD and the working tree (i.e. someone
+	// staged only part of the on-disk diff — `git add -p`, or a
+	// hand-built partial blob), plain `git add -- <path>` overwrites that
+	// index entry with the full working-tree content, silently folding in
+	// whatever else is sitting on disk — which may belong to a different
+	// author entirely.
+	describe('BDL-2882: partial (hunk-level) staged content must not be silently overwritten', () => {
+		/** Manually stage ONLY `partialContent` for `relativePath`, leaving `workingTreeContent` on disk unstaged on top of it. */
+		function stagePartialHunk({
+			relativePath,
+			partialContent,
+			workingTreeContent,
+		}: {
+			relativePath: string;
+			partialContent: string;
+			workingTreeContent: string;
+		}): string {
+			writeFileSync(join(tmpRepo, relativePath), partialContent);
+			const blob = gitCmd('hash-object', '-w', '--', relativePath);
+			gitCmd('update-index', '--cacheinfo', `100644,${blob},${relativePath}`);
+			writeFileSync(join(tmpRepo, relativePath), workingTreeContent);
+			return blob;
+		}
+
+		function stagedBlobFor(relativePath: string): string {
+			const entry = gitCmd('ls-files', '-s', '--', relativePath);
+			return entry.split(/\s+/)[1] ?? '';
+		}
+
+		test('commit refuses to overwrite a partially-staged file with the full working-tree content', () => {
+			createFile('shared.ts', 'line1\nline2\nline3\n');
+			gitCmd('add', 'shared.ts');
+			gitCmd('commit', '-m', 'add shared.ts', '--no-verify');
+			const base = gitCmd('rev-parse', 'HEAD');
+
+			// "Mine": only line1 changed, staged deliberately.
+			// "Theirs": an unrelated, unstaged change to line3 sitting on disk.
+			const stagedBlob = stagePartialHunk({
+				relativePath: 'shared.ts',
+				partialContent: 'MINE\nline2\nline3\n',
+				workingTreeContent: 'MINE\nline2\nTHEIRS\n',
+			});
+			expect(stagedBlobFor('shared.ts')).toBe(stagedBlob);
+
+			const result = gac('commit -f shared.ts -m "test: my change only" --no-verify');
+
+			// THE WITNESS: refuse and leave the staged content untouched — never
+			// silently fold THEIRS into a commit under MY message.
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('shared.ts');
+			expect(stagedBlobFor('shared.ts')).toBe(stagedBlob);
+			expect(gitCmd('rev-parse', 'HEAD')).toBe(base);
+		});
+
+		test('stage refuses the same silent overwrite — the filter has TWO call sites', () => {
+			createFile('shared.ts', 'line1\nline2\nline3\n');
+			gitCmd('add', 'shared.ts');
+			gitCmd('commit', '-m', 'add shared.ts', '--no-verify');
+
+			const stagedBlob = stagePartialHunk({
+				relativePath: 'shared.ts',
+				partialContent: 'MINE\nline2\nline3\n',
+				workingTreeContent: 'MINE\nline2\nTHEIRS\n',
+			});
+
+			const result = gac('stage -f shared.ts');
+
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain('shared.ts');
+			expect(stagedBlobFor('shared.ts')).toBe(stagedBlob);
+		});
+
+		test('other direction: a fully-staged file (no unstaged remainder) is committed normally', () => {
+			// The rule must not become "never git add a --files path" — that
+			// would trivially pass a preservation-only check while making the
+			// tool useless. A file with no unstaged remainder is the ordinary
+			// case and must still work exactly as before.
+			createFile('normal.ts', 'export const v = 1;\n');
+			gitCmd('add', 'normal.ts');
+			gitCmd('commit', '-m', 'add normal.ts', '--no-verify');
+			createFile('normal.ts', 'export const v = 2;\n');
+			gitCmd('add', 'normal.ts');
+
+			const result = gac('commit -f normal.ts -m "test: ordinary full stage" --no-verify');
+
+			expect(result.exitCode).toBe(0);
+			expect(gitCmd('show', 'HEAD:normal.ts')).toContain('export const v = 2;');
+		});
+
+		test('other direction: an untouched-index file (only a working-tree edit) is staged and committed normally', () => {
+			createFile('untouched.ts', 'export const v = 1;\n');
+			gitCmd('add', 'untouched.ts');
+			gitCmd('commit', '-m', 'add untouched.ts', '--no-verify');
+			// No prior `git add` at all — index still matches HEAD.
+			createFile('untouched.ts', 'export const v = 2;\n');
+
+			const result = gac('commit -f untouched.ts -m "test: plain edit" --no-verify');
+
+			expect(result.exitCode).toBe(0);
+			expect(gitCmd('show', 'HEAD:untouched.ts')).toContain('export const v = 2;');
+		});
+	});
 });
